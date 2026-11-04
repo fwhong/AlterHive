@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/alterhive/alterhive/internal/domain"
-	"github.com/alterhive/alterhive/internal/llm"
 )
 
 // DeceptionPlannerAgent is the strategic LLM deception planner. It produces
@@ -17,21 +16,21 @@ import (
 // logic (TopologyPlanner.MergePlan) so the plan can be validated by consistency
 // and safety agents before any world mutation.
 type DeceptionPlannerAgent struct {
-	llm      CompletionClient
+	decider  DecisionClient
 	topology *domain.VirtualTopology
 }
 
 // NewDeceptionPlannerAgent creates a ready-to-use deception planner.
-func NewDeceptionPlannerAgent(llmClient CompletionClient, topology *domain.VirtualTopology) *DeceptionPlannerAgent {
+func NewDeceptionPlannerAgent(decider DecisionClient, topology *domain.VirtualTopology) *DeceptionPlannerAgent {
 	return &DeceptionPlannerAgent{
-		llm:      llmClient,
+		decider:  decider,
 		topology: topology,
 	}
 }
 
 // IsActive returns true when the LLM client is available.
 func (p *DeceptionPlannerAgent) IsActive() bool {
-	return p != nil && !completionClientInactive(p.llm)
+	return p != nil && !decisionClientInactive(p.decider)
 }
 
 // Plan generates a strategic DeceptionPlan via LLM for the given session and
@@ -48,30 +47,22 @@ func (p *DeceptionPlannerAgent) Plan(ctx context.Context, session *domain.Sessio
 	// Build a composite profile from session state
 	profile := ProfileFromSession(session)
 
-	req := llm.CompletionRequest{
-		MaxTokens:      1600,
-		Temperature:    0.1,
-		ResponseFormat: "json_object",
-		Messages: []llm.Message{
-			{Role: "system", Content: buildPlannerSystemPrompt()},
-			{Role: "user", Content: buildPlannerUserPrompt(session, p.topology, buildPlannerCommand(intent, event), profile)},
-		},
+	req := DecisionRequest{
+		SessionID:   session.SessionID,
+		CallSite:    SiteDeceptionPlan,
+		Command:     buildPlannerCommand(intent, event),
+		UserContent: buildPlannerUserPrompt(session, p.topology, buildPlannerCommand(intent, event), profile),
 	}
 
-	resp, err := p.llm.Complete(ctx, req)
+	resp, err := p.decider.Decide(ctx, req)
 	if err != nil {
 		return DeceptionPlan{}, fmt.Errorf("llm planner: %w", err)
 	}
-	if strings.TrimSpace(resp.Content) == "" {
+	if resp.Plan == nil {
 		return DeceptionPlan{}, fmt.Errorf("empty LLM planner response")
 	}
 
-	plan, err := parseDeceptionPlanContent(resp.Content)
-	if err != nil {
-		return DeceptionPlan{}, fmt.Errorf("parse deception plan: %w", err)
-	}
-
-	plan = p.enrichPlan(plan, intent, event, session)
+	plan := p.enrichPlan(*resp.Plan, intent, event, session)
 	return plan, nil
 }
 
@@ -126,28 +117,22 @@ func (p *DeceptionPlannerAgent) RepairPlan(ctx context.Context, session *domain.
 	}
 	b, _ := json.Marshal(payload)
 
-	req := llm.CompletionRequest{
-		MaxTokens:      1600,
-		Temperature:    0.1,
-		ResponseFormat: "json_object",
-		Messages: []llm.Message{
-			{Role: "system", Content: buildPlannerSystemPrompt()},
-			{Role: "user", Content: string(b)},
-		},
+	req := DecisionRequest{
+		SessionID:   session.SessionID,
+		CallSite:    SitePlanRepair,
+		Command:     buildPlannerCommand(intent, event),
+		UserContent: string(b),
 	}
 
-	resp, err := p.llm.Complete(ctx, req)
+	resp, err := p.decider.Decide(ctx, req)
 	if err != nil {
 		return DeceptionPlan{}, fmt.Errorf("repair planner: %w", err)
 	}
-	if strings.TrimSpace(resp.Content) == "" {
+	if resp.Plan == nil {
 		return DeceptionPlan{}, fmt.Errorf("empty repair response")
 	}
 
-	repaired, err := parseDeceptionPlanContent(resp.Content)
-	if err != nil {
-		return DeceptionPlan{}, err
-	}
+	repaired := *resp.Plan
 	if repaired.PlanID == "" {
 		repaired.PlanID = "llm_repair:" + plan.PlanID
 	}

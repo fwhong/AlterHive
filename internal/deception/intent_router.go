@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/alterhive/alterhive/internal/domain"
-	"github.com/alterhive/alterhive/internal/llm"
 )
 
 var whitespacePattern = regexp.MustCompile(`\s+`)
@@ -54,15 +53,15 @@ func (r IntentResult) PlanKey() string {
 // IntentRouterAgent combines a deterministic fast path with an optional LLM
 // parser for ambiguous or natural-language attacker goals.
 type IntentRouterAgent struct {
-	llm      CompletionClient
+	decider  DecisionClient
 	topology *domain.VirtualTopology
 	mu       sync.Mutex
 	cache    map[string]IntentResult
 }
 
-func NewIntentRouterAgent(topology *domain.VirtualTopology, llmClient CompletionClient) *IntentRouterAgent {
+func NewIntentRouterAgent(topology *domain.VirtualTopology, decider DecisionClient) *IntentRouterAgent {
 	return &IntentRouterAgent{
-		llm:      llmClient,
+		decider:  decider,
 		topology: topology,
 		cache:    make(map[string]IntentResult),
 	}
@@ -111,7 +110,7 @@ func (r *IntentRouterAgent) routeAsync(cacheKey string, event CommandEvent, sess
 }
 
 func (r *IntentRouterAgent) shouldAskLLM(command string, fast IntentResult) bool {
-	if completionClientInactive(r.llm) {
+	if decisionClientInactive(r.decider) {
 		return false
 	}
 	lower := strings.ToLower(strings.TrimSpace(command))
@@ -131,28 +130,20 @@ func (r *IntentRouterAgent) shouldAskLLM(command string, fast IntentResult) bool
 }
 
 func (r *IntentRouterAgent) routeWithLLM(ctx context.Context, event CommandEvent, session *domain.SessionContext, fast IntentResult) (IntentResult, error) {
-	req := llm.CompletionRequest{
-		MaxTokens:      700,
-		Temperature:    0.0,
-		ResponseFormat: "json_object",
-		Messages: []llm.Message{
-			{Role: "system", Content: buildIntentRouterSystemPrompt()},
-			{Role: "user", Content: buildIntentRouterUserPrompt(event, session, fast, r.topology)},
-		},
+	req := DecisionRequest{
+		SessionID:   event.SessionID,
+		CallSite:    SiteIntentRoute,
+		Command:     event.Command,
+		UserContent: buildIntentRouterUserPrompt(event, session, fast, r.topology),
 	}
-	resp, err := r.llm.Complete(ctx, req)
+	resp, err := r.decider.Decide(ctx, req)
 	if err != nil {
 		return IntentResult{}, err
 	}
-	if strings.TrimSpace(resp.Content) == "" {
+	if resp.Intent == nil {
 		return IntentResult{}, fmt.Errorf("empty LLM intent response")
 	}
-	var result IntentResult
-	if err := json.Unmarshal([]byte(resp.Content), &result); err != nil {
-		return IntentResult{}, fmt.Errorf("parse LLM intent: %w", err)
-	}
-	result.Source = "llm_intent_router"
-	return sanitizeLLMIntent(result)
+	return *resp.Intent, nil
 }
 
 func (r *IntentRouterAgent) cacheKey(event CommandEvent, session *domain.SessionContext) string {

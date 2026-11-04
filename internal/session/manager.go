@@ -12,7 +12,6 @@ import (
 	"github.com/alterhive/alterhive/internal/domain"
 	"github.com/alterhive/alterhive/internal/engine"
 	"github.com/alterhive/alterhive/internal/intent"
-	"github.com/alterhive/alterhive/internal/llm"
 	"github.com/alterhive/alterhive/internal/tracer"
 )
 
@@ -35,8 +34,11 @@ type Manager struct {
 	hostname       string
 }
 
-// NewManager creates a session manager.
-func NewManager(topology *domain.VirtualTopology, safety *domain.SafetyPolicy, tr tracer.Tracer, hostname string, llmMgr *llm.Manager) *Manager {
+// NewManager creates a session manager. The decider is the cold-path
+// decision client: standalone mode passes a local client wrapping the
+// in-process llm.Manager (deception.AsDecisionClient), sensor mode passes a
+// remote client; nil disables the cold path.
+func NewManager(topology *domain.VirtualTopology, safety *domain.SafetyPolicy, tr tracer.Tracer, hostname string, decider deception.DecisionClient) *Manager {
 	registry := domain.NewServiceRegistry(topology)
 	m := &Manager{
 		sessions:       make(map[string]*domain.SessionContext),
@@ -46,12 +48,12 @@ func NewManager(topology *domain.VirtualTopology, safety *domain.SafetyPolicy, t
 		safety:         safety,
 		registry:       registry,
 		engine:         engine.NewRuleEngine(topology, safety, registry),
-		orchestrator:   deception.NewAgentOrchestrator(topology, llmMgr, safety),
+		orchestrator:   deception.NewAgentOrchestrator(topology, decider, safety),
 		frustration:    make(map[string]*deception.FrustrationAnalyzer),
 		tracer:         tr,
 		hostname:       hostname,
 	}
-	m.engine.SetLLM(llmMgr)
+	m.engine.SetDecider(decider)
 	go m.idleSessionCleaner()
 	return m
 }

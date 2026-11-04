@@ -80,16 +80,16 @@ type PlanBreadcrumb struct {
 
 // TopologyPlanner runs a fast deterministic planner and an optional async LLM planner.
 type TopologyPlanner struct {
-	llm      CompletionClient
+	decider  DecisionClient
 	topology *domain.VirtualTopology
 	mu       sync.Mutex
 	inflight map[string]bool
 }
 
 // NewTopologyPlanner creates an agentic planner for topology graph mutations.
-func NewTopologyPlanner(topology *domain.VirtualTopology, llmClient CompletionClient) *TopologyPlanner {
+func NewTopologyPlanner(topology *domain.VirtualTopology, decider DecisionClient) *TopologyPlanner {
 	return &TopologyPlanner{
-		llm:      llmClient,
+		decider:  decider,
 		topology: topology,
 		inflight: make(map[string]bool),
 	}
@@ -131,7 +131,7 @@ func (p *TopologyPlanner) PlanDecision(session *domain.SessionContext, command s
 		added = p.MergePlan(session, plan)
 
 		// Async path: schedule LLM enrichment in the background.
-		if scheduleLLM && !completionClientInactive(p.llm) {
+		if scheduleLLM && !decisionClientInactive(p.decider) {
 			if session.Planning != nil {
 				session.Planning.RecordLLMPlanningCall()
 			}
@@ -450,7 +450,7 @@ func filterProtectedTargets(plan TopologyPlan, session *domain.SessionContext) (
 }
 
 func (p *TopologyPlanner) scheduleLLMPlan(session *domain.SessionContext, command string, profile AgentProfile) {
-	if completionClientInactive(p.llm) {
+	if decisionClientInactive(p.decider) {
 		return
 	}
 	key := session.SessionID + ":" + command
@@ -501,33 +501,20 @@ func completionClientInactive(client CompletionClient) bool {
 }
 
 func (p *TopologyPlanner) llmPlan(ctx context.Context, session *domain.SessionContext, command string, profile AgentProfile) (DeceptionPlan, error) {
-	req := llm.CompletionRequest{
-		MaxTokens:      1600,
-		Temperature:    0.1,
-		ResponseFormat: "json_object",
-		Messages: []llm.Message{
-			{Role: "system", Content: buildPlannerSystemPrompt()},
-			{Role: "user", Content: buildPlannerUserPrompt(session, p.topology, command, profile)},
-		},
+	req := DecisionRequest{
+		SessionID:   session.SessionID,
+		CallSite:    SiteTopologyPlan,
+		Command:     command,
+		UserContent: buildPlannerUserPrompt(session, p.topology, command, profile),
 	}
-	resp, err := p.llm.Complete(ctx, req)
+	resp, err := p.decider.Decide(ctx, req)
 	if err != nil {
 		return DeceptionPlan{}, err
 	}
-	if strings.TrimSpace(resp.Content) == "" {
+	if resp.Plan == nil {
 		return DeceptionPlan{}, fmt.Errorf("empty LLM planner response")
 	}
-	plan, err := parseDeceptionPlanContent(resp.Content)
-	if err != nil {
-		repaired, repairErr := p.repairPlanJSON(ctx, resp.Content)
-		if repairErr != nil {
-			return DeceptionPlan{}, fmt.Errorf("parse deception plan: %w; repair failed: %v", err, repairErr)
-		}
-		plan, err = parseDeceptionPlanContent(repaired)
-		if err != nil {
-			return DeceptionPlan{}, fmt.Errorf("parse repaired deception plan: %w", err)
-		}
-	}
+	plan := *resp.Plan
 	if plan.PlanID == "" {
 		plan.PlanID = "llm_planner:" + command
 	}
@@ -541,53 +528,24 @@ func (p *TopologyPlanner) repairRejectedPlan(ctx context.Context, session *domai
 		"original_input": buildPlannerUserPrompt(session, p.topology, command, profile),
 	}
 	b, _ := json.Marshal(payload)
-	req := llm.CompletionRequest{
-		MaxTokens:      1600,
-		Temperature:    0.1,
-		ResponseFormat: "json_object",
-		Messages: []llm.Message{
-			{Role: "system", Content: buildPlannerSystemPrompt()},
-			{Role: "user", Content: string(b)},
-		},
+	req := DecisionRequest{
+		SessionID:   session.SessionID,
+		CallSite:    SitePlanRepair,
+		Command:     command,
+		UserContent: string(b),
 	}
-	resp, err := p.llm.Complete(ctx, req)
+	resp, err := p.decider.Decide(ctx, req)
 	if err != nil {
 		return DeceptionPlan{}, err
 	}
-	if strings.TrimSpace(resp.Content) == "" {
+	if resp.Plan == nil {
 		return DeceptionPlan{}, fmt.Errorf("empty rejected-plan repair response")
 	}
-	repaired, err := parseDeceptionPlanContent(resp.Content)
-	if err != nil {
-		return DeceptionPlan{}, err
-	}
+	repaired := *resp.Plan
 	if repaired.PlanID == "" {
 		repaired.PlanID = "llm_repair:" + command
 	}
 	return repaired, nil
-}
-
-func (p *TopologyPlanner) repairPlanJSON(ctx context.Context, raw string) (string, error) {
-	if strings.TrimSpace(raw) == "" {
-		return "", fmt.Errorf("empty raw planner response")
-	}
-	req := llm.CompletionRequest{
-		MaxTokens:      1200,
-		Temperature:    0,
-		ResponseFormat: "json_object",
-		Messages: []llm.Message{
-			{Role: "system", Content: "Repair this AlterHive TopologyPlan into one valid JSON object only. Do not add markdown or commentary. Preserve fields and intent; do not create protected targets."},
-			{Role: "user", Content: raw},
-		},
-	}
-	resp, err := p.llm.Complete(ctx, req)
-	if err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(resp.Content) == "" {
-		return "", fmt.Errorf("empty repair response")
-	}
-	return resp.Content, nil
 }
 
 func parseTopologyPlanContent(content string, plan *TopologyPlan) error {

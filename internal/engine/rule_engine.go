@@ -27,7 +27,9 @@ type RuleEngine struct {
 	Topology *domain.VirtualTopology
 	Safety   *domain.SafetyPolicy
 	Registry *domain.ServiceRegistry
-	LLM      completionClient
+	// Decider is the cold-path decision surface. Standalone mode wraps the
+	// in-process llm.Manager; sensor mode gets a remote decision client.
+	Decider deception.DecisionClient
 }
 
 type completionClient interface {
@@ -44,14 +46,22 @@ func NewRuleEngine(topology *domain.VirtualTopology, safety *domain.SafetyPolicy
 	}
 }
 
-// SetLLM attaches the optional LLM fallback generator.
+// SetLLM attaches a local LLM manager as the decision client (standalone).
 func (e *RuleEngine) SetLLM(manager *llm.Manager) {
-	e.LLM = manager
+	e.Decider = deception.AsDecisionClient(manager)
 }
 
-// SetLLMClient is used by tests and adapters that implement the completion surface.
+// SetLLMClient is used by tests and adapters that implement the completion
+// surface. The client is wrapped into a local decision client so tests run
+// the exact decision path production uses.
 func (e *RuleEngine) SetLLMClient(client completionClient) {
-	e.LLM = client
+	e.Decider = deception.AsDecisionClient(client)
+}
+
+// SetDecider attaches a decision client directly (sensor mode remote client
+// or an already-wrapped local client).
+func (e *RuleEngine) SetDecider(decider deception.DecisionClient) {
+	e.Decider = decider
 }
 
 // HandleCommand processes a command and returns (output, evidence_hits, llm_generated).
@@ -211,7 +221,7 @@ func isComplexCommand(cmdBase string) bool {
 // Returns ("", nil) only when the LLM is unavailable, in which case
 // HandleCommand falls through to the rule-engine switch.
 func (e *RuleEngine) handleComplexViaLLM(cmd, cmdBase string, session *domain.SessionContext, world *domain.WorldState, ppfTriggered bool) (string, []string) {
-	if e.LLM == nil || !e.LLM.IsActive() {
+	if decisionClientNil(e.Decider) {
 		return "", nil
 	}
 
@@ -234,8 +244,9 @@ func (e *RuleEngine) handleComplexViaLLM(cmd, cmdBase string, session *domain.Se
 	return ruleOutput, evidenceHits
 }
 
-// handleComplexAsync calls the LLM asynchronously and caches the result
-// so subsequent invocations of the same command use the LLM-authored output.
+// handleComplexAsync asks the decision side to author a richer variant of the
+// deterministic output and caches the result so subsequent invocations of the
+// same command use the LLM-authored output.
 func (e *RuleEngine) handleComplexAsync(cmd, cmdBase string, session *domain.SessionContext, world *domain.WorldState, ruleOutput string) {
 	structuredFacts := formatStructuredFacts(cmd, cmdBase, ruleOutput, session, e.Topology)
 
@@ -251,48 +262,35 @@ func (e *RuleEngine) handleComplexAsync(cmd, cmdBase string, session *domain.Ses
 		protectedTargets = strings.Join(session.Planning.ProtectedTargetList(), ", ")
 	}
 
-	seed := time.Now().UnixNano() % 1000
+	seed := int(time.Now().UnixNano() % 1000)
 	scanVariant := seed % 5
 
-	systemContent := fmt.Sprintf(`You are a Linux terminal on host %s (Ubuntu 22.04). User: %s. CWD: %s.
-An attacker (AI pentest agent or human) just ran a network/service command. You must produce the exact raw terminal output that command would print.
-
-RANDOMIZATION SEED: %d  VARIANT: %d
-
-COMMAND FACTS (authoritative ground truth — USE these facts, do NOT COPY them verbatim):
-%s
-
-CRITICAL: Author fresh terminal output. Do NOT echo the fact strings. Vary with the seed:
-- nmap version: pick from [7.92, 7.93, 7.94, 7.95] based on variant %% 4
-- latency: 0.0012s-0.0089s range, jittered by seed
-- scan time: 1.8s-4.5s range, jittered by seed
-- timestamp format: vary between ISO 8601 and Unix-style
-- spacing/alignment: vary column widths slightly
-- banner strings: use realistic variations (e.g. "OpenSSH 8.9p1" vs "OpenSSH 8.4p1")
-
-Return ONLY raw terminal output. No markdown, fences, prompts, or analysis.
-Every IP/port/service from the facts MUST appear. Do not invent new facts.
-Keep output under 40 lines.
-Topology: %s
-Protected targets already known to the attacker: %s
-%s
-%s`, session.Hostname, session.User, session.CWD, seed, scanVariant, structuredFacts, topologyContext, protectedTargets, memorySummary(session), strategyPrompt)
-
-	req := llm.CompletionRequest{
-		MaxTokens:   800,
-		Temperature: 0.9,
-		Messages: []llm.Message{
-			{Role: "system", Content: systemContent},
-			{Role: "user", Content: fmt.Sprintf("Recent commands:\n%s\nFiles in cwd: %s\n%s\nProduce the raw terminal output for this command:\n%s", commandHistoryTail(session, 5), strings.Join(world.ListFiles(session.CWD), ", "), contextAwareSlice(cmd, session), cmd)},
+	req := deception.DecisionRequest{
+		SessionID: session.SessionID,
+		CallSite:  deception.SiteComplexRender,
+		Command:   cmd,
+		UserContent: fmt.Sprintf("Recent commands:\n%s\nFiles in cwd: %s\n%s\nProduce the raw terminal output for this command:\n%s",
+			commandHistoryTail(session, 5), strings.Join(world.ListFiles(session.CWD), ", "), contextAwareSlice(cmd, session), cmd),
+		Terminal: &deception.TerminalRenderInput{
+			Hostname:         session.Hostname,
+			User:             session.User,
+			CWD:              session.CWD,
+			Seed:             seed,
+			ScanVariant:      scanVariant,
+			StructuredFacts:  structuredFacts,
+			TopologyContext:  topologyContext,
+			ProtectedTargets: protectedTargets,
+			MemorySummary:    memorySummary(session),
+			StrategyPrompt:   strategyPrompt,
 		},
 	}
 
-	resp, err := e.LLM.Complete(ctx, req)
+	resp, err := e.Decider.Decide(ctx, req)
 	if err != nil {
 		recordLLMFallbackEvent(session, "complex_complete_error:"+err.Error(), cmd)
 		return
 	}
-	output := sanitizeTerminalOutput(resp.Content)
+	output := resp.Content
 	if output == "" {
 		recordLLMFallbackEvent(session, "complex_empty_after_sanitize", cmd)
 		return
@@ -315,6 +313,11 @@ Protected targets already known to the attacker: %s
 		session.Planning.BumpWorldVersion("llm_async_cached:" + cmdBase)
 	}
 	recordLLMFallbackEvent(session, "complex_llm_authored", cmd)
+}
+
+// decisionClientNil reports whether no decision client is attached.
+func decisionClientNil(decider deception.DecisionClient) bool {
+	return decider == nil || !decider.IsActive()
 }
 
 // formatStructuredFacts converts raw rule-engine output into a compact
@@ -910,7 +913,7 @@ func randHex(rng *rand.Rand, n int) string {
 }
 
 func (e *RuleEngine) llmFallback(cmd string, session *domain.SessionContext, world *domain.WorldState) string {
-	if e.LLM == nil || !e.LLM.IsActive() {
+	if decisionClientNil(e.Decider) {
 		recordLLMFallbackEvent(session, "inactive", cmd)
 		return ""
 	}
@@ -939,42 +942,28 @@ func (e *RuleEngine) llmFallbackAsync(cmd string, session *domain.SessionContext
 		protectedTargets = strings.Join(session.Planning.ProtectedTargetList(), ", ")
 	}
 
-	systemContent := fmt.Sprintf(`You are a Linux terminal on host %s (Ubuntu 22.04). User: %s. CWD: %s.
-Rules:
-- Return ONLY raw terminal output. No markdown, no fences, no prompts, no explanations.
-- Never explain how you chose the output. Never write analysis, reasoning, or phrases like "we need to".
-- If a file does not exist, generate realistic content for a staging web server.
-- If a command needs root and user is not root, return "Permission denied".
-- For "ls" on a directory, list realistic files. For "cat", show realistic file content.
-- Do not invent new IPs, hostnames, services, credentials, routes, or successful exploit facts.
-- You may only mention IPs present in the approved topology or protected target list.
-- Keep output under 15 lines. Be terse like a real terminal.
-Topology: %s
-Protected targets already known to the attacker: %s
-%s
-%s`, session.Hostname, session.User, session.CWD, topologyContext, protectedTargets, memorySummary(session), strategyPrompt)
-
-	req := llm.CompletionRequest{
-		MaxTokens:   500,
-		Temperature: 0.3,
-		Messages: []llm.Message{
-			{
-				Role:    "system",
-				Content: systemContent,
-			},
-			{
-				Role:    "user",
-				Content: fmt.Sprintf("Recent commands: %s\nFiles in cwd: %s\n%sRun this command and return only its output:\n%s", commandHistoryTail(session, 5), strings.Join(world.ListFiles(session.CWD), ", "), contextAwareSlice(cmd, session), cmd),
-			},
+	req := deception.DecisionRequest{
+		SessionID: session.SessionID,
+		CallSite:  deception.SiteLLMFallback,
+		Command:   cmd,
+		UserContent: fmt.Sprintf("Recent commands: %s\nFiles in cwd: %s\n%sRun this command and return only its output:\n%s", commandHistoryTail(session, 5), strings.Join(world.ListFiles(session.CWD), ", "), contextAwareSlice(cmd, session), cmd),
+		Terminal: &deception.TerminalRenderInput{
+			Hostname:         session.Hostname,
+			User:             session.User,
+			CWD:              session.CWD,
+			TopologyContext:  topologyContext,
+			ProtectedTargets: protectedTargets,
+			MemorySummary:    memorySummary(session),
+			StrategyPrompt:   strategyPrompt,
 		},
 	}
 
-	resp, err := e.LLM.Complete(ctx, req)
+	resp, err := e.Decider.Decide(ctx, req)
 	if err != nil {
 		recordLLMFallbackEvent(session, "complete_error:"+err.Error(), cmd)
 		return
 	}
-	output := sanitizeTerminalOutput(resp.Content)
+	output := resp.Content
 	if output == "" {
 		recordLLMFallbackEvent(session, "empty_after_sanitize", cmd)
 		return
@@ -1105,109 +1094,6 @@ func commandHistoryTail(session *domain.SessionContext, limit int) string {
 		cmds = append(cmds, entry.Command)
 	}
 	return strings.Join(cmds, "\n")
-}
-
-func sanitizeTerminalOutput(output string) string {
-	output = strings.TrimSpace(output)
-	if output == "" {
-		return ""
-	}
-
-	// Strip markdown code fences (```python, ```bash, ``` etc.)
-	lines := strings.Split(output, "\n")
-	var cleaned []string
-	inFence := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		// Detect opening/closing fences
-		if strings.HasPrefix(trimmed, "```") {
-			inFence = !inFence
-			continue
-		}
-		// Skip prompt artifacts the LLM echoed back
-		lower := strings.ToLower(trimmed)
-		if strings.HasPrefix(lower, "current files near cwd:") {
-			break // Everything after this is prompt context, not output
-		}
-		if strings.HasPrefix(lower, "command:") && len(trimmed) < 80 {
-			break
-		}
-		if strings.HasPrefix(lower, "command history tail:") {
-			break
-		}
-		if strings.HasPrefix(lower, "evidence:") && len(trimmed) < 200 {
-			break
-		}
-		if strings.HasPrefix(lower, "access states:") {
-			break
-		}
-		if strings.HasPrefix(lower, "ppf triggered:") {
-			break
-		}
-		if strings.HasPrefix(lower, "memory:") && len(trimmed) < 200 {
-			break
-		}
-		// Skip standalone language identifiers
-		if trimmed == "python" || trimmed == "bash" || trimmed == "sh" || trimmed == "shell" {
-			continue
-		}
-		// Skip AI disclaimers
-		if strings.Contains(lower, "as an ai") || strings.Contains(lower, "as a language model") {
-			return ""
-		}
-		if looksLikeLLMReasoning(trimmed) {
-			continue
-		}
-		cleaned = append(cleaned, line)
-	}
-
-	output = strings.Join(cleaned, "\n")
-	output = strings.TrimSpace(output)
-	if output == "" {
-		return ""
-	}
-	return strings.TrimRight(output, "\n") + "\n"
-}
-
-func looksLikeLLMReasoning(line string) bool {
-	lower := strings.ToLower(strings.TrimSpace(line))
-	if lower == "" {
-		return false
-	}
-	reasoningPrefixes := []string{
-		"we need to",
-		"i need to",
-		"i'll ",
-		"the user is",
-		"according to",
-		"consider ",
-		"example:",
-		"example content",
-		"better:",
-		"alternatively",
-		"but ",
-		"maybe ",
-		"that includes",
-		"given the strategy",
-		"the rules ",
-		"this command ",
-		"thus,",
-		"output:",
-		"make it ",
-		"we should",
-		"i should",
-		"let's",
-		"so ",
-	}
-	for _, prefix := range reasoningPrefixes {
-		if strings.HasPrefix(lower, prefix) {
-			return true
-		}
-	}
-	return strings.Contains(lower, "return only") ||
-		strings.Contains(lower, "simulate the output") ||
-		strings.Contains(lower, "plausible output") ||
-		strings.Contains(lower, "terminal output")
 }
 
 // isShellError detects when the shell responder returned an error or empty result

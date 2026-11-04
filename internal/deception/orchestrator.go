@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/alterhive/alterhive/internal/domain"
-	"github.com/alterhive/alterhive/internal/llm"
 )
 
 // WorldPatch is the common structured output produced by specialist agents.
@@ -61,7 +60,7 @@ type OrchestrationResult struct {
 // Cold Path (asynchronous): EventBus → DeceptionPlanner → WorldBuilder → Evidence → Consistency → Safety → Cache → World Store
 type AgentOrchestrator struct {
 	topology *domain.VirtualTopology
-	llm      CompletionClient
+	decider  DecisionClient
 	planner  *TopologyPlanner
 	router   *IntentRouterAgent
 	agents   []WorldAgent
@@ -86,24 +85,24 @@ type WorldAgent interface {
 	Plan(session *domain.SessionContext, world *domain.WorldState, command string, added []domain.VirtualHost) WorldPatch
 }
 
-func NewAgentOrchestrator(topology *domain.VirtualTopology, llmClient CompletionClient, safetyPolicy *domain.SafetyPolicy) *AgentOrchestrator {
+func NewAgentOrchestrator(topology *domain.VirtualTopology, decider DecisionClient, safetyPolicy *domain.SafetyPolicy) *AgentOrchestrator {
 	eventBus := NewEventBus()
 	cacheMgr := NewCacheManager()
 	memoryAgent := NewMemoryAgent()
 	planExecutor := NewPlanExecutor(eventBus, cacheMgr)
 	responseAgent := NewResponseAgent(topology, safetyPolicy)
 	safetyAgent := NewSafetyAgent(safetyPolicy, eventBus)
-	deceptionPlanner := NewDeceptionPlannerAgent(llmClient, topology)
+	deceptionPlanner := NewDeceptionPlannerAgent(decider, topology)
 	worldBuilder := NewWorldBuilderAgent(topology, cacheMgr)
 	evidenceAgent := NewEvidenceAgent(cacheMgr)
 
 	orchestrator := &AgentOrchestrator{
 		topology: topology,
-		llm:      llmClient,
-		planner:  NewTopologyPlanner(topology, llmClient),
-		router:   NewIntentRouterAgent(topology, llmClient),
+		decider:  decider,
+		planner:  NewTopologyPlanner(topology, decider),
+		router:   NewIntentRouterAgent(topology, decider),
 		agents: []WorldAgent{
-			LLMWorldPatchAgent{llm: llmClient, topology: topology},
+			LLMWorldPatchAgent{decider: decider, topology: topology},
 			evidenceAgent,
 			ServicePersonaAgent{},
 			ExploitStageAgent{},
@@ -464,7 +463,7 @@ func orchestrationSummary(patches []WorldPatch) string {
 }
 
 type LLMWorldPatchAgent struct {
-	llm      CompletionClient
+	decider  DecisionClient
 	topology *domain.VirtualTopology
 }
 
@@ -484,7 +483,7 @@ func (a LLMWorldPatchAgent) Plan(session *domain.SessionContext, world *domain.W
 	// LLM enrichment runs asynchronously and lands on the next command cycle.
 	fallback := localWorldPatchFallback(session, a.topology, command, added, "fast_path")
 
-	if !completionClientInactive(a.llm) {
+	if !decisionClientInactive(a.decider) {
 		if !allowLLMContextExport() {
 			return fallback
 		}
@@ -500,28 +499,17 @@ func (a LLMWorldPatchAgent) planAsync(session *domain.SessionContext, command st
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	req := llm.CompletionRequest{
-		MaxTokens:      900,
-		Temperature:    0.25,
-		ResponseFormat: "json_object",
-		Messages: []llm.Message{
-			{Role: "system", Content: buildWorldPatchSystemPrompt()},
-			{Role: "user", Content: buildWorldPatchUserPrompt(session, a.topology, command, added)},
-		},
+	req := DecisionRequest{
+		SessionID:   session.SessionID,
+		CallSite:    SiteWorldPatch,
+		Command:     command,
+		UserContent: buildWorldPatchUserPrompt(session, a.topology, command, added),
 	}
-	resp, err := a.llm.Complete(ctx, req)
-	if err != nil || strings.TrimSpace(resp.Content) == "" {
+	resp, err := a.decider.Decide(ctx, req)
+	if err != nil || resp.Patch == nil {
 		return
 	}
-	patch, err := parseWorldPatchContent(resp.Content)
-	if err != nil || patch.Source == "" {
-		return
-	}
-	patch = sanitizeWorldPatch(patch)
-	patch.Source = "llm_world_patch_agent"
-	if patch.Reason == "" {
-		patch.Reason = "llm_async_enrichment"
-	}
+	patch := *resp.Patch
 
 	// Store enrichment patch as a pending event for next Hot Path cycle.
 	if session != nil {
