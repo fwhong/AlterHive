@@ -1,0 +1,67 @@
+# AlterHive manager/sensor split deployment (issue #3: edge-node sub-agent
+# callback architecture).
+#
+# The manager holds all LLM provider credentials (configs/llm.yaml +
+# ALTERHIVE_*_API_KEY) and is the only container allowed to reach an LLM
+# endpoint. Sensors run the honeypot only; their decision egress is the
+# manager on the private alterhive-internal network.
+#
+# Standalone (upstream) behavior remains available by running the image with
+# ALTERHIVE_ROLE unset.
+services:
+  manager:
+    image: "${ALTERHIVE_IMAGE:-alterhive-v100-honeypot:latest}"
+    container_name: alterhive-manager
+    command: ["./alterhive"]
+    environment:
+      ALTERHIVE_ROLE: manager
+      CONFIG_DIR: /app/configs
+      # Required: refuse to start without auth (fail closed).
+      ALTERHIVE_MANAGER_TOKEN: ${ALTERHIVE_MANAGER_TOKEN:?set ALTERHIVE_MANAGER_TOKEN}
+      ALTERHIVE_MANAGER_ADDR: ":8100"
+      # Manager-side gate for provider egress (must be true for LLM use).
+      ALTERHIVE_ALLOW_LLM_NETWORK: "true"
+    volumes:
+      # llm.yaml lives ONLY here: provider ids, base_url, api_key (or
+      # ALTERHIVE_<ID>_API_KEY env on this service).
+      - ./manager-configs:/app/configs:ro
+    networks:
+      - alterhive-internal
+      - alterhive-ops
+    restart: unless-stopped
+
+  sensor:
+    image: "${ALTERHIVE_IMAGE:-alterhive-v100-honeypot:latest}"
+    container_name: alterhive-sensor
+    command: ["./alterhive"]
+    environment:
+      ALTERHIVE_ROLE: sensor
+      CONFIG_DIR: /app/configs
+      ALTERHIVE_MANAGER_URL: http://alterhive-manager:8100
+      ALTERHIVE_MANAGER_TOKEN: ${ALTERHIVE_MANAGER_TOKEN:?set ALTERHIVE_MANAGER_TOKEN}
+      SSH_ADDR: "${SENSOR_SSH_ADDR:-0.0.0.0:2222}"
+      API_ADDR: ":8000"
+      # Sensor-side gate: allow sending session context to the manager.
+      ALTERHIVE_ALLOW_LLM_CONTEXT_EXPORT: "true"
+      # Optionally override the admin token of the sensor's own :8000 API.
+      # ALTERHIVE_ADMIN_TOKEN: sensor-admin-token
+    ports:
+      # Expose the honeypot SSH only where attackers should reach it.
+      - "${SENSOR_SSH_PUBLISH:-127.0.0.1:2222}:2222"
+      # Ops-facing session viewing (frontend talks to this).
+      - "${SENSOR_API_PUBLISH:-127.0.0.1:8000}:8000"
+    volumes:
+      # topology.yaml + services/ssh.yaml only — NO llm.yaml here by design.
+      - ./sensor-configs:/app/configs:ro
+    networks:
+      - alterhive-internal
+    depends_on:
+      - manager
+    restart: unless-stopped
+
+networks:
+  # Decision traffic: sensors → manager. No external exposure.
+  alterhive-internal:
+    internal: true
+  # Ops access to the manager's LLM admin API (:8100) and healthz.
+  alterhive-ops:
