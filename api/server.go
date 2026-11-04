@@ -34,10 +34,14 @@ var (
 
 // NewServer creates a new API server.
 func NewServer(manager *session.Manager, llmMgr *llm.Manager) *Server {
+	token := os.Getenv("ALTERHIVE_ADMIN_TOKEN")
+	if token == "" {
+		token = "alterhive-admin-token"
+	}
 	return &Server{
 		manager: manager,
 		llm:     llmMgr,
-		token:   "alterhive-admin-token",
+		token:   token,
 	}
 }
 
@@ -63,13 +67,7 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		v1.GET("/config/runtime/update-status", s.authMiddleware(), s.getRuntimeUpdateStatus)
 
 		// LLM management
-		v1.GET("/llm/providers", s.authMiddleware(), s.llmProviders)
-		v1.GET("/llm/active", s.authMiddleware(), s.llmActive)
-		v1.POST("/llm/switch/:id", s.authMiddleware(), s.llmSwitch)
-		v1.PUT("/llm/providers/:id", s.authMiddleware(), s.llmUpdateProvider)
-		v1.POST("/llm/test/:id", s.authMiddleware(), s.llmTest)
-		v1.GET("/llm/providers/:id/models", s.authMiddleware(), s.llmModels)
-		v1.PUT("/llm/enabled", s.authMiddleware(), s.llmSetEnabled)
+		s.RegisterLLMRoutes(v1)
 
 		v1.GET("/system/info", s.authMiddleware(), s.systemInfo)
 
@@ -83,6 +81,19 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		v1.POST("/simulate/goal", s.simGoal)
 		v1.GET("/simulate/session/:id", s.simSessionStatus)
 	}
+}
+
+// RegisterLLMRoutes registers only the LLM management routes on an existing
+// /api/v1 group. The manager process reuses this to expose provider
+// administration without mounting the honeypot session routes.
+func (s *Server) RegisterLLMRoutes(v1 *gin.RouterGroup) {
+	v1.GET("/llm/providers", s.authMiddleware(), s.llmProviders)
+	v1.GET("/llm/active", s.authMiddleware(), s.llmActive)
+	v1.POST("/llm/switch/:id", s.authMiddleware(), s.llmSwitch)
+	v1.PUT("/llm/providers/:id", s.authMiddleware(), s.llmUpdateProvider)
+	v1.POST("/llm/test/:id", s.authMiddleware(), s.llmTest)
+	v1.GET("/llm/providers/:id/models", s.authMiddleware(), s.llmModels)
+	v1.PUT("/llm/enabled", s.authMiddleware(), s.llmSetEnabled)
 }
 
 func (s *Server) authMiddleware() gin.HandlerFunc {
