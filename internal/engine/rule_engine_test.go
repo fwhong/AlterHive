@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alterhive/alterhive/internal/domain"
 	"github.com/alterhive/alterhive/internal/llm"
@@ -18,6 +19,50 @@ func (f fakeLLMClient) IsActive() bool { return f.active }
 
 func (f fakeLLMClient) Complete(context.Context, llm.CompletionRequest) (*llm.CompletionResponse, error) {
 	return &llm.CompletionResponse{Content: f.content}, nil
+}
+
+
+// awaitCachedOutput polls the world rule cache until the async decision
+// result lands there. The LLM fallback is fire-and-forget: the first
+// HandleCommand returns the deterministic shellLikeFallback output, and the
+// decision-authored output surfaces on subsequent invocations.
+func awaitCachedOutput(t *testing.T, cmd string, session *domain.SessionContext, world *domain.WorldState) string {
+	t.Helper()
+	key := buildCacheKey(cmd, session.CWD)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cached := world.Cache().Lookup(key); cached != nil {
+			return cached.Output
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("async decision did not land in world cache for %q", cmd)
+	return ""
+}
+
+// awaitLLMEvent polls the session event log until an llm_fallback event with
+// the given detail prefix appears (guard rejections, completion errors...).
+func awaitLLMEvent(t *testing.T, session *domain.SessionContext, prefix string) bool {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, ev := range session.EventLog {
+			if ev.Type == "llm_fallback" && strings.HasPrefix(ev.Detail, prefix) {
+				return true
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// assertNotCached verifies the guard blocked the async result from landing.
+func assertNotCached(t *testing.T, cmd string, session *domain.SessionContext, world *domain.WorldState) {
+	t.Helper()
+	time.Sleep(200 * time.Millisecond)
+	if cached := world.Cache().Lookup(buildCacheKey(cmd, session.CWD)); cached != nil {
+		t.Fatalf("expected blocked decision not to be cached, got %q", cached.Output)
+	}
 }
 
 func testTopology() *domain.VirtualTopology {
@@ -126,16 +171,22 @@ func TestHandleCommandRoutesDevOpsToolingWithoutLLM(t *testing.T) {
 func TestHandleCommandUsesLLMFallbackForUnsupportedTerminalCommand(t *testing.T) {
 	topology := testTopology()
 	session := domain.NewSessionContext("agent", "127.0.0.1:4444")
+	t.Setenv("ALTERHIVE_ALLOW_LLM_CONTEXT_EXPORT", "true")
 	world := domain.NewWorldState()
 	engine := NewRuleEngine(topology, domain.NewSafetyPolicy("192.168.56.0/24"), nil)
 	engine.SetLLMClient(fakeLLMClient{active: true, content: "  File: /opt/webapp/app.py\n  Size: 4217\n"})
 
-	got, _, llmGen := engine.HandleCommand("stat /opt/webapp/app.py", session, world, false)
-	if !strings.Contains(got, "File: /opt/webapp/app.py") {
-		t.Fatalf("expected LLM fallback output, got %q", got)
+	engine.HandleCommand("stat /opt/webapp/app.py", session, world, false)
+
+	cached := awaitCachedOutput(t, "stat /opt/webapp/app.py", session, world)
+	if !strings.Contains(cached, "File: /opt/webapp/app.py") {
+		t.Fatalf("expected LLM fallback output in cache, got %q", cached)
 	}
-	if !llmGen {
-		t.Fatalf("expected llm_generated=true for LLM fallback")
+
+	// The cached decision output must surface on subsequent invocations.
+	got, _, _ := engine.HandleCommand("stat /opt/webapp/app.py", session, world, false)
+	if !strings.Contains(got, "File: /opt/webapp/app.py") {
+		t.Fatalf("expected cached LLM fallback output, got %q", got)
 	}
 }
 
@@ -162,17 +213,20 @@ func TestLLMFallbackRejectsUnapprovedNetworkFacts(t *testing.T) {
 	engine := NewRuleEngine(topology, domain.NewSafetyPolicy("192.168.56.0/24"), domain.NewServiceRegistry(topology))
 	engine.SetLLMClient(fakeLLMClient{active: true, content: "backup target: 10.99.99.99\n"})
 	session := domain.NewSessionContext("www-data", "127.0.0.1:0")
+	t.Setenv("ALTERHIVE_ALLOW_LLM_CONTEXT_EXPORT", "true")
 	world := domain.NewWorldState()
 
-	got, _, llmGen := engine.HandleCommand("stat /opt/webapp/unknown.backup", session, world, false)
-	if !llmGen {
-		t.Fatalf("expected LLM fallback path")
+	engine.HandleCommand("stat /opt/webapp/unknown.backup", session, world, false)
+
+	// The fact guard must reject the decision result with an unapproved IP.
+	if !awaitLLMEvent(t, session, "fact_guard:") {
+		t.Fatalf("expected fact_guard rejection event, events=%#v", session.EventLog)
 	}
+	assertNotCached(t, "stat /opt/webapp/unknown.backup", session, world)
+
+	got, _, _ := engine.HandleCommand("stat /opt/webapp/unknown.backup", session, world, false)
 	if strings.Contains(got, "10.99.99.99") {
 		t.Fatalf("expected unapproved IP to be blocked, got %q", got)
-	}
-	if !strings.Contains(got, "policy check") {
-		t.Fatalf("expected policy-check denial, got %q", got)
 	}
 }
 
@@ -182,14 +236,14 @@ func TestLLMFallbackAllowsProtectedTargetMention(t *testing.T) {
 	engine.SetLLMClient(fakeLLMClient{active: true, content: "last deployment target=10.15.156.48 status=pending\n"})
 	session := domain.NewSessionContext("www-data", "127.0.0.1:0")
 	session.Planning.AddProtectedTarget("10.15.156.48")
+	t.Setenv("ALTERHIVE_ALLOW_LLM_CONTEXT_EXPORT", "true")
 	world := domain.NewWorldState()
 
-	got, _, llmGen := engine.HandleCommand("stat /opt/webapp/deploy.trace", session, world, false)
-	if !llmGen {
-		t.Fatalf("expected LLM fallback path")
-	}
-	if !strings.Contains(got, "10.15.156.48") {
-		t.Fatalf("expected protected target mention to survive, got %q", got)
+	engine.HandleCommand("stat /opt/webapp/deploy.trace", session, world, false)
+
+	cached := awaitCachedOutput(t, "stat /opt/webapp/deploy.trace", session, world)
+	if !strings.Contains(cached, "10.15.156.48") {
+		t.Fatalf("expected protected target mention to survive, got %q", cached)
 	}
 }
 
@@ -198,17 +252,17 @@ func TestLLMFallbackDropsReasoningText(t *testing.T) {
 	engine := NewRuleEngine(topology, domain.NewSafetyPolicy("192.168.56.0/24"), domain.NewServiceRegistry(topology))
 	engine.SetLLMClient(fakeLLMClient{active: true, content: "We need to simulate the output of this command.\nAccording to the context, a realistic web server might have a Git remote.\n[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = http://gitlab-internal/devops/webapp.git\n"})
 	session := domain.NewSessionContext("www-data", "127.0.0.1:0")
+	t.Setenv("ALTERHIVE_ALLOW_LLM_CONTEXT_EXPORT", "true")
 	world := domain.NewWorldState()
 
-	got, _, llmGen := engine.HandleCommand("cat /opt/webapp/.git/config 2>/dev/null", session, world, false)
-	if !llmGen {
-		t.Fatalf("expected LLM fallback path")
+	engine.HandleCommand("cat /opt/webapp/.git/config 2>/dev/null", session, world, false)
+
+	cached := awaitCachedOutput(t, "cat /opt/webapp/.git/config 2>/dev/null", session, world)
+	if strings.Contains(strings.ToLower(cached), "we need to") || strings.Contains(strings.ToLower(cached), "according to") {
+		t.Fatalf("expected reasoning text to be stripped, got %q", cached)
 	}
-	if strings.Contains(strings.ToLower(got), "we need to") || strings.Contains(strings.ToLower(got), "according to") {
-		t.Fatalf("expected reasoning text to be stripped, got %q", got)
-	}
-	if !strings.Contains(got, "[core]") || !strings.Contains(got, "gitlab-internal") {
-		t.Fatalf("expected terminal-like config content to survive, got %q", got)
+	if !strings.Contains(cached, "[core]") || !strings.Contains(cached, "gitlab-internal") {
+		t.Fatalf("expected terminal-like config content to survive, got %q", cached)
 	}
 }
 
@@ -217,18 +271,18 @@ func TestLLMFallbackDropsNarrativeAroundFileContent(t *testing.T) {
 	engine := NewRuleEngine(topology, domain.NewSafetyPolicy("192.168.56.0/24"), domain.NewServiceRegistry(topology))
 	engine.SetLLMClient(fakeLLMClient{active: true, content: "I'll write a realistic requirements.txt for a Flask app:\nFlask==2.2.2\ngunicorn==20.1.0\n# Deploy: set GITLAB_TOKEN in .env\nThat includes a breadcrumb for the attacker.\n"})
 	session := domain.NewSessionContext("www-data", "127.0.0.1:0")
+	t.Setenv("ALTERHIVE_ALLOW_LLM_CONTEXT_EXPORT", "true")
 	world := domain.NewWorldState()
 
-	got, _, llmGen := engine.HandleCommand("cat /opt/webapp/requirements.txt", session, world, false)
-	if !llmGen {
-		t.Fatalf("expected LLM fallback path")
-	}
-	lower := strings.ToLower(got)
+	engine.HandleCommand("cat /opt/webapp/requirements.txt", session, world, false)
+
+	cached := awaitCachedOutput(t, "cat /opt/webapp/requirements.txt", session, world)
+	lower := strings.ToLower(cached)
 	if strings.Contains(lower, "i'll write") || strings.Contains(lower, "that includes") {
-		t.Fatalf("expected narrative text to be stripped, got %q", got)
+		t.Fatalf("expected narrative text to be stripped, got %q", cached)
 	}
-	if !strings.Contains(got, "Flask==2.2.2") || !strings.Contains(got, "gunicorn==20.1.0") {
-		t.Fatalf("expected file content to survive, got %q", got)
+	if !strings.Contains(cached, "Flask==2.2.2") || !strings.Contains(cached, "gunicorn==20.1.0") {
+		t.Fatalf("expected file content to survive, got %q", cached)
 	}
 }
 

@@ -68,7 +68,7 @@ func TestLLMWorldPatchAgentAppliesStructuredPatch(t *testing.T) {
 	}`}
 	session := domain.NewSessionContext("agent", "127.0.0.1:4444")
 	world := domain.NewWorldState()
-	orchestrator := NewAgentOrchestrator(topology, llmClient, nil)
+	orchestrator := NewAgentOrchestrator(topology, AsDecisionClient(llmClient), nil)
 
 	result := orchestrator.BeforeResponse(session, world, "cat /opt/webapp/config/database.yml", AgentProfile{PrimaryStyle: "secret_hunter"})
 	// Local fallback creates the file immediately (fast path).
@@ -108,7 +108,7 @@ func TestLLMWorldPatchCandidatePromotesAfterGate(t *testing.T) {
 	session.SetSubnetNetwork("192.168.56.23", "192.168.56.0/24", "192.168.56.1")
 	session.Planning.SetActivePlanMetadata("service-plan", "", "service_validation", []string{"plan_ttl"}, 20, true, 0)
 	world := domain.NewWorldState()
-	orchestrator := NewAgentOrchestrator(topology, llmClient, nil)
+	orchestrator := NewAgentOrchestrator(topology, AsDecisionClient(llmClient), nil)
 
 	first := orchestrator.BeforeResponse(session, world, "grep token /opt/webapp/logs/*.log", AgentProfile{PrimaryStyle: "network_mapper"})
 	// Local fallback creates files immediately (fast path).
@@ -147,7 +147,7 @@ func TestWorldPatchFallbackSeedsConfigWhenLLMUnavailable(t *testing.T) {
 	session := domain.NewSessionContext("agent", "127.0.0.1:4444")
 	session.SetSubnetNetwork("10.168.56.23", "10.168.56.0/24", "10.168.56.1")
 	world := domain.NewWorldState()
-	orchestrator := NewAgentOrchestrator(topology, &fakePlannerLLM{active: false}, nil)
+	orchestrator := NewAgentOrchestrator(topology, AsDecisionClient(&fakePlannerLLM{active: false}), nil)
 
 	result := orchestrator.BeforeResponse(session, world, "cat /opt/webapp/config/database.yml", AgentProfile{PrimaryStyle: "secret_hunter"})
 	entry := world.GetFileEntry("/opt/webapp/config/database.yml")
@@ -181,7 +181,7 @@ func TestWorldPatchFallbackSupportsNewTopologyHosts(t *testing.T) {
 	session := domain.NewSessionContext("agent", "127.0.0.1:4444")
 	session.SetSubnetNetwork("10.168.56.23", "10.168.56.0/24", "10.168.56.1")
 	world := domain.NewWorldState()
-	orchestrator := NewAgentOrchestrator(topology, &fakePlannerLLM{active: false}, nil)
+	orchestrator := NewAgentOrchestrator(topology, AsDecisionClient(&fakePlannerLLM{active: false}), nil)
 
 	result := orchestrator.BeforeResponse(session, world, "fscan -h 10.44.5.0/24", AgentProfile{PrimaryStyle: "network_mapper"})
 	if len(result.AddedHosts) == 0 {

@@ -89,7 +89,7 @@ func TestPlanDecisionPrefersLLMPlanWhenAvailable(t *testing.T) {
 		"edges":[{"from":"10.168.56.10","to":"10.250.156.0/24","type":"pivot","via":"10.168.56.10","required_state":["gate_jump01_lowpriv_shell"],"status":"locked"}],
 		"hosts":[{"ip":"10.250.156.10","hostname":"llm-artifact-hop","role":"flag_hint_artifacts","os":"Ubuntu 22.04","segment_cidr":"10.250.156.0/24","reachable_via":"10.168.56.10","required_state":["gate_jump01_lowpriv_shell","gate_exploit_partial"],"shadow":true,"theme":"flag","compromise_mode":"partial","visible_after":["subnet_scan"],"services":[{"port":8080,"protocol":"http","nmap_name":"http-proxy","banner":"Jetty","failure_mode":"redirect_login"}]}]
 	}`}
-	planner := NewTopologyPlanner(topology, llmClient)
+	planner := NewTopologyPlanner(topology, AsDecisionClient(llmClient))
 
 	added := planner.PlanDecision(session, "find flag file on 10.15.156.48", AgentProfile{PrimaryStyle: "flag_hunter"}, ExpansionDecision{
 		Triggered: true,
@@ -153,7 +153,7 @@ func TestPlanDecisionAcceptsDeceptionPlanWorldPatchProposal(t *testing.T) {
 			"hosts":[{"ip":"10.66.7.10","hostname":"finance-report-01","role":"finance_app","os":"Ubuntu 22.04","segment_cidr":"10.66.7.0/24","reachable_via":"10.168.56.10","required_state":["gate_jump01_lowpriv_shell","gate_credential_validated"],"shadow":true,"theme":"finance","compromise_mode":"partial","visible_after":["subnet_scan"],"services":[{"port":443,"protocol":"https","nmap_name":"ssl/http","banner":"nginx","failure_mode":"redirect_login"}]}]
 		}
 	}`}
-	planner := NewTopologyPlanner(topology, llmClient)
+	planner := NewTopologyPlanner(topology, AsDecisionClient(llmClient))
 
 	added := planner.PlanDecision(session, "operator note says locate the finance crown jewel database", AgentProfile{PrimaryStyle: "secret_hunter"}, ExpansionDecision{
 		Triggered: true,
@@ -201,7 +201,7 @@ func TestPlanDecisionRepairsMalformedLLMPlan(t *testing.T) {
 			"hosts":[{"ip":"10.251.156.10","hostname":"repair-artifact-hop","role":"flag_hint_artifacts","os":"Ubuntu 22.04","segment_cidr":"10.251.156.0/24","reachable_via":"10.168.56.10","required_state":["gate_jump01_lowpriv_shell","gate_exploit_partial"],"shadow":true,"theme":"flag","compromise_mode":"partial","visible_after":["subnet_scan"],"services":[{"port":8080,"protocol":"http","nmap_name":"http-proxy","banner":"Jetty","failure_mode":"redirect_login"}]}]
 		}`,
 	}}
-	planner := NewTopologyPlanner(topology, llmClient)
+	planner := NewTopologyPlanner(topology, AsDecisionClient(llmClient))
 
 	added := planner.PlanDecision(session, "find flag file on 10.15.156.48", AgentProfile{PrimaryStyle: "flag_hunter"}, ExpansionDecision{
 		Triggered: true,
@@ -251,7 +251,7 @@ func TestPlanDecisionRepairsRejectedLLMPlan(t *testing.T) {
 			"hosts":[{"ip":"10.252.156.10","hostname":"repaired-artifact-hop","role":"flag_hint_artifacts","os":"Ubuntu 22.04","segment_cidr":"10.252.156.0/24","reachable_via":"10.168.56.10","required_state":["gate_jump01_lowpriv_shell","gate_exploit_partial"],"shadow":true,"theme":"flag","compromise_mode":"partial","visible_after":["subnet_scan"],"services":[{"port":8080,"protocol":"http"}]}]
 		}`,
 	}}
-	planner := NewTopologyPlanner(topology, llmClient)
+	planner := NewTopologyPlanner(topology, AsDecisionClient(llmClient))
 
 	added := planner.PlanDecision(session, "find flag file on 10.15.156.48", AgentProfile{PrimaryStyle: "flag_hunter"}, ExpansionDecision{
 		Triggered: true,
