@@ -881,7 +881,10 @@ type PendingSSH struct {
 
 // SessionContext holds all state for a single attacker session.
 type SessionContext struct {
-	mu sync.RWMutex
+	mu        sync.RWMutex
+	commandMu sync.Mutex
+	pendingMu sync.Mutex
+	pending   []func()
 
 	SessionID      string     `json:"session_id"`
 	Username       string     `json:"username"`

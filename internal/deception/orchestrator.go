@@ -120,6 +120,8 @@ func NewAgentOrchestrator(topology *domain.VirtualTopology, decider DecisionClie
 		evidenceAgent:    evidenceAgent,
 	}
 
+	// Validated asynchronous graph merges must update virtual command policy too.
+	orchestrator.planner.safety = safetyPolicy
 	// Wire EventBus subscribers for the Cold Path
 	eventBus.Subscribe(EventTargetShift, orchestrator.onPlanningEvent)
 	eventBus.Subscribe(EventNewSubnet, orchestrator.onPlanningEvent)
@@ -130,6 +132,7 @@ func NewAgentOrchestrator(topology *domain.VirtualTopology, decider DecisionClie
 }
 
 func (o *AgentOrchestrator) BeforeResponse(session *domain.SessionContext, world *domain.WorldState, command string, profile AgentProfile) OrchestrationResult {
+	session.ApplyPending()
 	return o.HandleCommandEvent(NewCommandEvent(session, command, profile), session, world)
 }
 
@@ -151,7 +154,8 @@ func (o *AgentOrchestrator) HandleCommandEvent(event CommandEvent, session *doma
 			result.Decision = RuntimeDecision{Action: ActionFullReplan, Reason: "plan_executor_invalidated"}
 			// Cold Path: publish replan event
 			if o.eventBus != nil {
-				o.eventBus.PublishAsync(PlanningEvent{
+				o.eventBus.Publish(PlanningEvent{
+					Session:   session,
 					Type:      EventPlanInvalidated,
 					SessionID: session.SessionID,
 					Command:   event.Command,
@@ -240,7 +244,8 @@ func (o *AgentOrchestrator) HandleCommandEvent(event CommandEvent, session *doma
 	if o.eventBus != nil && (route.ShouldScheduleLLM || route.ShouldPlan || route.IsGoalShift || route.IsNewDiscovery) {
 		events := MapIntentToEvent(route, session.SessionID, event.Command)
 		for _, ev := range events {
-			o.eventBus.PublishAsync(ev)
+			ev.Session = session
+			o.eventBus.Publish(ev)
 		}
 	}
 
@@ -258,7 +263,7 @@ func (o *AgentOrchestrator) HandleCommandEvent(event CommandEvent, session *doma
 // onPlanningEvent is the Cold Path subscriber. When a high-priority event fires,
 // it triggers the DeceptionPlanner → WorldBuilder → Evidence pipeline async.
 func (o *AgentOrchestrator) onPlanningEvent(event PlanningEvent) *RuntimeAction {
-	if o == nil || o.deceptionPlanner == nil || !o.deceptionPlanner.IsActive() {
+	if o == nil || event.Session == nil || o.deceptionPlanner == nil || !o.deceptionPlanner.IsActive() {
 		return nil
 	}
 
@@ -284,13 +289,14 @@ func (o *AgentOrchestrator) onPlanningEvent(event PlanningEvent) *RuntimeAction 
 		intent.TargetIP = ip
 	}
 
-	// Async: Planner → WorldBuilder → Evidence
-	o.deceptionPlanner.PlanAsync(nil, intent, event, func(plan DeceptionPlan, err error) {
+	// Freeze repair context on the same hot path as the original planning input.
+	original := DecisionRequest{SessionID: event.SessionID, Command: event.Command, UserContent: buildPlannerUserPrompt(event.Session, o.topology, event.Command, ProfileFromSession(event.Session))}
+	// Async: Planner → guarded world merge
+	o.deceptionPlanner.PlanAsync(event.Session, intent, event, func(plan DeceptionPlan, err error) {
 		if err != nil {
 			return
 		}
-		// The plan is produced; TopologyPlanner.MergeDeceptionPlan applies it
-		// WorldBuilder and EvidenceAgent process the result on the next Hot Path cycle
+		event.Session.QueueMutation(func() { o.planner.acceptAsyncPlan(event.Session, original, plan, true) })
 	})
 
 	action := ActionFullReplan
@@ -488,47 +494,32 @@ func (a LLMWorldPatchAgent) Plan(session *domain.SessionContext, world *domain.W
 			return fallback
 		}
 		// Cold Path: fire-and-forget LLM call with a short timeout.
-		// Results are stored as events for the next Hot Path cycle.
-		go a.planAsync(session, command, added)
+		// Results are queued for guarded application on the next Hot Path cycle.
+		req := DecisionRequest{SessionID: session.SessionID, CallSite: SiteWorldPatch, Command: command, UserContent: buildWorldPatchUserPrompt(session, a.topology, command, added)}
+		go a.planAsync(session, world, command, req)
 	}
 
 	return fallback
 }
 
-func (a LLMWorldPatchAgent) planAsync(session *domain.SessionContext, command string, added []domain.VirtualHost) {
+func (a LLMWorldPatchAgent) planAsync(session *domain.SessionContext, world *domain.WorldState, command string, req DecisionRequest) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	req := DecisionRequest{
-		SessionID:   session.SessionID,
-		CallSite:    SiteWorldPatch,
-		Command:     command,
-		UserContent: buildWorldPatchUserPrompt(session, a.topology, command, added),
-	}
 	resp, err := a.decider.Decide(ctx, req)
 	if err != nil || resp.Patch == nil {
 		return
 	}
 	patch := *resp.Patch
 
-	// Store enrichment patch as a pending event for next Hot Path cycle.
-	if session != nil {
-		session.AppendEvent(domain.EventEntry{
-			Type:      "llm_world_patch_async",
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			SessionID: session.SessionID,
-			Detail:    fmt.Sprintf("files=%d hosts=%d", len(patch.Files), len(patch.AddedHosts)),
-		})
-		// Store the patch payload so the next cycle can apply it.
-		if data, err := json.Marshal(patch); err == nil {
-			session.AppendEvent(domain.EventEntry{
-				Type:      "llm_world_patch_payload",
-				Timestamp: time.Now().UTC().Format(time.RFC3339),
-				SessionID: session.SessionID,
-				Detail:    string(data),
-			})
+	// Apply through the same critic and gates as synchronous specialist patches.
+	session.QueueMutation(func() {
+		if rejected := (&ConsistencyCriticAgent{}).Review(patch, a.topology, session); rejected.Rejected {
+			return
 		}
-	}
+		applyWorldPatch(session, world, patch, command)
+		session.AppendEvent(domain.EventEntry{Type: "llm_world_patch_async", Timestamp: time.Now().UTC().Format(time.RFC3339), SessionID: session.SessionID, Detail: fmt.Sprintf("files=%d hosts=%d", len(patch.Files), len(patch.AddedHosts))})
+	})
 }
 
 func localWorldPatchFallback(session *domain.SessionContext, topology *domain.VirtualTopology, command string, added []domain.VirtualHost, reason string) WorldPatch {

@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 
+import { getManagerToken, setManagerToken } from "../services/api";
 import { usePageRefresh } from "../layouts/AppLayout";
 import {
   fetchLLMActive,
@@ -76,16 +77,19 @@ export function StatusPage() {
   const [config, setConfig] = useState<RuntimeConfig | null>(null);
   const [llm, setLLM] = useState<LLMActiveInfo | null>(null);
   const [loading, setLoading] = useState(true);
+  const [managerTokenDraft, setManagerTokenDraft] = useState(getManagerToken());
+  const [llmError, setLLMError] = useState("");
   const [error, setError] = useState("");
 
   async function loadData() {
     setLoading(true);
     setError("");
+    setLLMError("");
     try {
       const [infoData, configData, llmData] = await Promise.all([
         fetchSystemInfo(),
         fetchRuntimeConfig(),
-        fetchLLMActive(),
+        fetchLLMActive().catch(err => { setLLMError(toErrorMessage(err, "manager unavailable")); return null; }),
       ]);
       setInfo(infoData);
       setConfig(configData);
@@ -122,7 +126,7 @@ export function StatusPage() {
         </Col>
         <Col xs={24} lg={12}>
           <Card title={t("honeypotConfig")} className="ah-panel status-top-card">
-            <HoneypotConfigForm config={config?.honeypot} onSaved={loadData} />
+            <HoneypotConfigForm readOnly={!!config?.read_only} config={config?.honeypot} onSaved={loadData} />
           </Card>
         </Col>
       </Row>
@@ -132,7 +136,12 @@ export function StatusPage() {
         title={<Space><Plug size={16} />{t("llm.title")}{llm?.is_active ? <Tag color="green">{t("llm.enabled")}</Tag> : <Tag>{t("llm.disabled")}</Tag>}</Space>}
         className="ah-panel"
       >
-        <AiConfigForm providers={providers} activeId={activeId} llmEnabled={!!llm?.enabled} onSaved={loadData} />
+        <Space direction="vertical" style={{width:"100%"}}>
+          <Typography.Text>Manager 运维凭据独立于 sensor；仅保存在当前浏览器标签页。</Typography.Text>
+          <Space><Input.Password value={managerTokenDraft} onChange={e=>setManagerTokenDraft(e.target.value)} placeholder="Manager admin token" autoComplete="off"/><Button onClick={()=>{setManagerToken(managerTokenDraft);loadData();}}>连接 Manager</Button></Space>
+          {llmError && <Alert type="warning" message={llmError}/>}
+          {llm && <AiConfigForm readOnly={!!llm.read_only} providers={providers} activeId={activeId} llmEnabled={!!llm.enabled} onSaved={loadData} />}
+        </Space>
       </Card>
     </div>
   );
@@ -142,7 +151,8 @@ export function StatusPage() {
 /*  HoneypotConfigForm                                                 */
 /* ------------------------------------------------------------------ */
 
-function HoneypotConfigForm({ config, onSaved }: {
+function HoneypotConfigForm({ config, onSaved, readOnly }: {
+  readOnly: boolean;
   config?: RuntimeConfig["honeypot"];
   onSaved: () => void;
 }) {
@@ -166,7 +176,13 @@ function HoneypotConfigForm({ config, onSaved }: {
       setUpdating(true);
       setUpdatePercent(12);
       setUpdateStep(t("updateModal.progressSteps.writingConfig"));
-      await updateRuntimeConfig({ honeypot: values });
+      const result = await updateRuntimeConfig({ honeypot: values });
+      if (!result.restart_queued) {
+        setUpdating(false);
+        message.success("配置已保存；请运维手动重启服务。");
+        onSaved();
+        return;
+      }
       setUpdatePercent(28);
       setUpdateStep(t("updateModal.progressSteps.rebuilding"));
       waitForRuntimeRecovery(values);
@@ -335,7 +351,8 @@ function HoneypotConfigForm({ config, onSaved }: {
 /*  AiConfigForm — the main LLM config component                       */
 /* ------------------------------------------------------------------ */
 
-function AiConfigForm({ providers, activeId, llmEnabled, onSaved }: {
+function AiConfigForm({ providers, activeId, llmEnabled, onSaved, readOnly }: {
+  readOnly: boolean;
   providers: LLMProvider[];
   activeId: string;
   llmEnabled: boolean;
@@ -387,7 +404,7 @@ function AiConfigForm({ providers, activeId, llmEnabled, onSaved }: {
   async function handleFetchModels() {
     setModelsLoading(true);
     try {
-      const models = await fetchProviderModels(form.id, form.base_url, form.api_key);
+      const models = await fetchProviderModels(form.id);
       setDynamicModels(models);
       if (models.length > 0) {
         message.success(t("llm.messages.modelsFetched", { count: models.length }));
@@ -405,7 +422,7 @@ function AiConfigForm({ providers, activeId, llmEnabled, onSaved }: {
     setTestState("loading");
     setTestMsg("");
     try {
-      const res = await testLLMProvider(form.id, form.base_url, form.api_key);
+      const res = await testLLMProvider(form.id);
       if (res.ok) {
         setTestState("success");
         setTestMsg(t("llm.messages.connectionOk"));
@@ -474,13 +491,14 @@ function AiConfigForm({ providers, activeId, llmEnabled, onSaved }: {
 
   return (
     <div>
+      {readOnly && <Alert type="info" message="Manager 使用只读配置；请在可信运维端修改配置并重启。" style={{marginBottom:16}}/>}
       {/* Global enable + provider cards */}
       <div style={{ marginBottom: 24 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
           <span style={{ fontWeight: 500, fontSize: 14 }}>{t("llm.selectProvider")}</span>
           <Space>
             <span style={{ fontWeight: 500, fontSize: 13 }}>{t("llm.llmEnable")}</span>
-            <Switch checked={llmEnabled} onChange={handleToggleEnabled} />
+            <Switch disabled={readOnly} checked={llmEnabled} onChange={handleToggleEnabled} />
           </Space>
         </div>
         <Row gutter={[12, 12]}>
@@ -520,6 +538,7 @@ function AiConfigForm({ providers, activeId, llmEnabled, onSaved }: {
             <Col span={14}>
               <div style={{ marginBottom: 4, fontWeight: 500 }}>{t("llm.baseUrl")}</div>
               <Input
+                disabled={readOnly || !!form.key_configured}
                 prefix={<Globe size={14} />}
                 value={form.base_url}
                 onChange={e => setForm({ ...form, base_url: e.target.value })}
@@ -534,8 +553,8 @@ function AiConfigForm({ providers, activeId, llmEnabled, onSaved }: {
               <Input.Password
                 value={form.api_key}
                 onChange={e => setForm({ ...form, api_key: e.target.value })}
-                placeholder={isOllama ? t("llm.customHint") : "sk-..."}
-                disabled={isOllama}
+                placeholder={form.key_configured ? "已配置（密钥不返回浏览器）" : "仅写入新密钥"}
+                disabled={isOllama || readOnly}
               />
             </Col>
           </Row>
@@ -557,7 +576,7 @@ function AiConfigForm({ providers, activeId, llmEnabled, onSaved }: {
                 </Tooltip>
               </Space>
             </div>
-            <AutoComplete
+            <AutoComplete disabled={readOnly}
               style={{ width: "100%" }}
               options={modelOptions}
               value={form.model}
@@ -594,7 +613,7 @@ function AiConfigForm({ providers, activeId, llmEnabled, onSaved }: {
               {t("llm.testConnection")}
             </Button>
 
-            <Button type="primary" loading={saving} onClick={handleSave}>
+            <Button disabled={readOnly} type="primary" loading={saving} onClick={handleSave}>
               {t("llm.saveConfig")}
             </Button>
           </div>

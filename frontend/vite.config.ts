@@ -6,6 +6,11 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      "/manager": {
+        target: "http://127.0.0.1:8110",
+        changeOrigin: true,
+        rewrite: path => path.replace(/^\/manager/, "")
+      },
       "/api": {
         target: "http://127.0.0.1:8000",
         changeOrigin: true

@@ -19,6 +19,7 @@ type Manager struct {
 	mu         sync.RWMutex
 	config     *LLMConfig
 	configPath string
+	readOnly   bool
 	providers  map[string]Provider
 	active     Provider
 }
@@ -26,13 +27,13 @@ type Manager struct {
 // NewManager creates a new LLM manager from config.
 func NewManager(config *LLMConfig, configPath string) *Manager {
 	m := &Manager{
-		config:     config,
+		config:     cloneConfig(config),
 		configPath: configPath,
 		providers:  make(map[string]Provider),
 	}
 
 	// Initialize all enabled providers
-	for _, cfg := range config.Providers {
+	for _, cfg := range m.config.Providers {
 		if cfg.Enabled && (cfg.HasAPIKey() || cfg.Type == "ollama") {
 			live := cfg
 			if key, _ := cfg.ResolveAPIKey(); key != "" {
@@ -45,7 +46,7 @@ func NewManager(config *LLMConfig, configPath string) *Manager {
 	}
 
 	// Set active provider
-	if active := config.GetActiveProvider(); active != nil && active.Enabled {
+	if active := m.config.GetActiveProvider(); active != nil && active.Enabled {
 		if p, ok := m.providers[active.ID]; ok {
 			m.active = p
 			log.WithField("provider", active.ID).Info("Active LLM provider set")
@@ -69,7 +70,14 @@ func (m *Manager) GetActiveProvider() *ProviderConfig {
 	if m.active == nil {
 		return nil
 	}
-	return m.config.GetActiveProvider()
+	cfg := m.config.GetActiveProvider()
+	if cfg == nil {
+		return nil
+	}
+	out := *cfg
+	out.KeyConfigured = out.HasAPIKey()
+	out.APIKey = ""
+	return &out
 }
 
 // Complete sends a completion request to the active provider.
@@ -80,215 +88,173 @@ func (m *Manager) Complete(ctx context.Context, req CompletionRequest) (*Complet
 
 	m.mu.RLock()
 	p := m.active
+	enabled := m.config.Enabled
+	// Capture the exact in-flight credential before concurrent configuration rotation.
+	var keys []string
+	for _, cfg := range m.config.Providers {
+		key, _ := cfg.ResolveAPIKey()
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
 	m.mu.RUnlock()
 
-	if p == nil {
+	if p == nil || !enabled {
 		return nil, fmt.Errorf("no active LLM provider configured")
 	}
-	return p.Complete(ctx, req)
+	resp, err := p.Complete(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("provider completion failed")
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("empty provider response")
+	}
+	for _, key := range keys {
+		resp.Content = strings.ReplaceAll(resp.Content, key, "[REDACTED]")
+	}
+	return resp, nil
 }
 
 func allowProviderNetworkRequests() bool {
 	return strings.EqualFold(os.Getenv("ALTERHIVE_ALLOW_LLM_NETWORK"), "true")
 }
 
-// TestConnection tests a specific provider's connection.
-// If overrideBaseURL or overrideAPIKey are non-empty, they override the saved config values.
-func (m *Manager) TestConnection(ctx context.Context, providerID, overrideBaseURL, overrideAPIKey string) error {
-	if !allowProviderNetworkRequests() {
-		return fmt.Errorf("LLM provider network requests are disabled")
+// TestConnection never mutates configuration or reuses a key for another URL.
+func (m *Manager) TestConnection(ctx context.Context, providerID, baseURL, key string) error {
+	cfg, err := m.connectionConfig(providerID, baseURL, key)
+	if err != nil {
+		return err
 	}
-
-	m.mu.RLock()
-	cfg := m.config.GetProvider(providerID)
-	m.mu.RUnlock()
-
-	if cfg == nil {
-		return fmt.Errorf("provider %q not found", providerID)
-	}
-
-	// Always start from the env-aware resolved key so an unset YAML
-	// field doesn't silently disable TestConnection.
-	resolved, _ := cfg.ResolveAPIKey()
-	if cfg.BaseURL == "" && overrideBaseURL == "" {
-		return fmt.Errorf("provider %q has no base URL configured", providerID)
-	}
-	if resolved == "" && overrideAPIKey == "" {
-		return fmt.Errorf("provider %q has no API key configured (set env %s or fill api_key)", providerID, cfg.APIKeyEnv())
-	}
-
-	if overrideBaseURL != "" {
-		cfg.BaseURL = overrideBaseURL
-	}
-	if overrideAPIKey != "" {
-		cfg.APIKey = overrideAPIKey
-	} else {
-		cfg.APIKey = resolved
-	}
-
-	p := NewProvider(*cfg)
-	return p.TestConnection(ctx)
+	return NewProvider(cfg).TestConnection(ctx)
 }
 
-// SwitchProvider changes the active provider.
-func (m *Manager) SwitchProvider(providerID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	cfg := m.config.GetProvider(providerID)
-	if cfg == nil {
-		return fmt.Errorf("provider %q not found", providerID)
+func (m *Manager) connectionConfig(id, baseURL, key string) (ProviderConfig, error) {
+	if !allowProviderNetworkRequests() {
+		return ProviderConfig{}, fmt.Errorf("LLM provider network requests are disabled")
 	}
-	if !cfg.Enabled {
-		return fmt.Errorf("provider %q is not enabled", providerID)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	p := m.config.GetProvider(id)
+	if p == nil {
+		return ProviderConfig{}, fmt.Errorf("provider not found")
 	}
-
-	p, ok := m.providers[providerID]
-	if !ok {
-		live := *cfg
-		if key, _ := cfg.ResolveAPIKey(); key != "" {
-			live.APIKey = key
-		}
-		p = NewProvider(live)
-		m.providers[providerID] = p
+	cfg := *p
+	// Even a changed path could expose credentials; overrides must exactly match.
+	if baseURL != "" && strings.TrimRight(baseURL, "/") != strings.TrimRight(cfg.BaseURL, "/") {
+		return ProviderConfig{}, fmt.Errorf("provider URL override is not permitted")
 	}
+	if key != "" {
+		return ProviderConfig{}, fmt.Errorf("credential overrides are not permitted")
+	}
+	cfg.APIKey, _ = cfg.ResolveAPIKey()
+	if err := validateProvider(cfg); err != nil {
+		return ProviderConfig{}, err
+	}
+	return cfg, nil
+}
 
-	m.active = p
-	m.config.ActiveProvider = providerID
-
-	// Save config
+// commitLocked persists BEFORE changing live state. Failure leaves everything intact.
+func (m *Manager) commitLocked(next *LLMConfig) error {
+	if m.readOnly {
+		return fmt.Errorf("LLM configuration is read-only")
+	}
 	if m.configPath != "" {
-		if err := m.config.Save(m.configPath); err != nil {
-			log.WithError(err).Warn("Failed to save LLM config")
+		if err := next.Save(m.configPath); err != nil {
+			return fmt.Errorf("cannot persist LLM configuration: %w", err)
 		}
 	}
-
-	log.WithField("provider", providerID).Info("Switched LLM provider")
+	m.config = next
+	m.rebuildLocked()
 	return nil
 }
-
-// SetEnabled globally enables or disables LLM.
+func (m *Manager) rebuildLocked() {
+	m.providers = make(map[string]Provider)
+	m.active = nil
+	for _, cfg := range m.config.Providers {
+		if cfg.Enabled && (cfg.HasAPIKey() || cfg.Type == "ollama") {
+			live := cfg
+			live.APIKey, _ = cfg.ResolveAPIKey()
+			m.providers[cfg.ID] = NewProvider(live)
+		}
+	}
+	if m.config.Enabled {
+		m.active = m.providers[m.config.ActiveProvider]
+	}
+}
+func cloneConfig(c *LLMConfig) *LLMConfig {
+	n := *c
+	n.Providers = append([]ProviderConfig{}, c.Providers...)
+	return &n
+}
+func (m *Manager) SetReadOnly(v bool) { m.mu.Lock(); defer m.mu.Unlock(); m.readOnly = v }
+func (m *Manager) ReadOnly() bool     { m.mu.RLock(); defer m.mu.RUnlock(); return m.readOnly }
+func (m *Manager) SwitchProvider(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	next := cloneConfig(m.config)
+	cfg := next.GetProvider(id)
+	if cfg == nil || !cfg.Enabled || (!cfg.HasAPIKey() && cfg.Type != "ollama") {
+		return fmt.Errorf("provider unavailable")
+	}
+	next.ActiveProvider = id
+	return m.commitLocked(next)
+}
 func (m *Manager) SetEnabled(enabled bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	m.config.Enabled = enabled
-	if !enabled {
-		m.active = nil
-	} else if m.config.ActiveProvider != "" {
-		// Re-activate the configured provider
-		if p, ok := m.providers[m.config.ActiveProvider]; ok {
-			m.active = p
-		}
-	}
-
-	if m.configPath != "" {
-		if err := m.config.Save(m.configPath); err != nil {
-			return err
-		}
-	}
-	return nil
+	next := cloneConfig(m.config)
+	next.Enabled = enabled
+	return m.commitLocked(next)
 }
-
-// UpdateProvider updates a provider's configuration.
 func (m *Manager) UpdateProvider(cfg ProviderConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	// Find and update in config
-	found := false
-	for i := range m.config.Providers {
-		if m.config.Providers[i].ID == cfg.ID {
-			m.config.Providers[i] = cfg
-			found = true
-			break
+	next := cloneConfig(m.config)
+	if old := next.GetProvider(cfg.ID); old != nil {
+		if cfg.BaseURL != old.BaseURL || cfg.KeyEnv != old.KeyEnv {
+			// Binding changes cannot silently carry a saved/environment key to a new origin.
+			if old.HasAPIKey() {
+				return fmt.Errorf("credential-bound provider endpoint cannot be changed; create a new provider")
+			}
 		}
-	}
-	if !found {
-		m.config.Providers = append(m.config.Providers, cfg)
-	}
-
-	// Recreate provider if enabled. Use HasAPIKey so a key coming from the
-	// environment still allows the provider to come up without forcing
-	// the user to duplicate the secret back into YAML.
-	if cfg.Enabled && (cfg.HasAPIKey() || cfg.Type == "ollama") {
-		live := cfg
-		if key, _ := cfg.ResolveAPIKey(); key != "" {
-			live.APIKey = key
+		if cfg.APIKey == "" || strings.Contains(cfg.APIKey, "****") {
+			cfg.APIKey = old.APIKey
 		}
-		p := NewProvider(live)
-		m.providers[cfg.ID] = p
+		*old = cfg
 	} else {
-		delete(m.providers, cfg.ID)
+		next.Providers = append(next.Providers, cfg)
 	}
-
-	// Update active if this was the active provider
-	if m.config.ActiveProvider == cfg.ID {
-		if cfg.Enabled {
-			m.active = m.providers[cfg.ID]
-		} else {
-			m.active = nil
-		}
+	if err := validateProvider(cfg); err != nil {
+		return err
 	}
-
-	// Save config
-	if m.configPath != "" {
-		if err := m.config.Save(m.configPath); err != nil {
-			log.WithError(err).Warn("Failed to save LLM config")
-		}
-	}
-
-	return nil
+	return m.commitLocked(next)
 }
 
-// ListProviders returns all provider configs.
-func (m *Manager) ListProviders() []ProviderConfig {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.config.Providers
-}
-
-// GetProviderReal returns the real (unmasked) provider config by ID.
-func (m *Manager) GetProviderReal(id string) *ProviderConfig {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.config.GetProvider(id)
-}
-
-// GetConfig returns the full LLM config.
-// API keys are returned as-is (frontend uses Input.Password to hide them visually).
+// Public snapshots contain presence flags, NEVER keys or caller-mutable backing slices.
 func (m *Manager) GetConfig() LLMConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
-	cfg := *m.config
-	return cfg
+	cfg := cloneConfig(m.config)
+	for i := range cfg.Providers {
+		cfg.Providers[i].KeyConfigured = cfg.Providers[i].HasAPIKey()
+		cfg.Providers[i].APIKey = ""
+	}
+	return *cfg
 }
+func (m *Manager) ListProviders() []ProviderConfig { return m.GetConfig().Providers }
 
 // FetchModels fetches the available model list from a provider's API.
-// If overrideBaseURL or overrideAPIKey are non-empty, they override the saved config values.
+// Overrides cannot redirect a saved credential; only the saved endpoint is used.
 func (m *Manager) FetchModels(ctx context.Context, providerID, overrideBaseURL, overrideAPIKey string) ([]ModelInfo, error) {
 	if !allowProviderNetworkRequests() {
 		return nil, fmt.Errorf("LLM provider network requests are disabled")
 	}
 
-	m.mu.RLock()
-	cfg := m.config.GetProvider(providerID)
-	m.mu.RUnlock()
-
-	if cfg == nil {
-		return nil, fmt.Errorf("provider %q not found", providerID)
+	cfg, err := m.connectionConfig(providerID, overrideBaseURL, overrideAPIKey)
+	if err != nil {
+		return nil, err
 	}
-
-	resolved, _ := cfg.ResolveAPIKey()
-	baseURL := cfg.BaseURL
-	apiKey := resolved
-	if overrideBaseURL != "" {
-		baseURL = overrideBaseURL
-	}
-	if overrideAPIKey != "" {
-		apiKey = overrideAPIKey
-	}
+	baseURL, apiKey := cfg.BaseURL, cfg.APIKey
 
 	switch cfg.Type {
 	case "anthropic":
@@ -315,16 +281,15 @@ func fetchOllamaModels(ctx context.Context, baseURL string) ([]ModelInfo, error)
 		return nil, err
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := providerHTTPClient(15 * time.Second)
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("connection failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Ollama API error (%d): %s", resp.StatusCode, string(body))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("Ollama API error (%d)", resp.StatusCode)
 	}
 
 	var result struct {
@@ -332,7 +297,7 @@ func fetchOllamaModels(ctx context.Context, baseURL string) ([]ModelInfo, error)
 			Name string `json:"name"`
 		} `json:"models"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&result); err != nil {
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
 
@@ -370,7 +335,7 @@ func fetchOpenAIModels(ctx context.Context, baseURL, apiKey string) ([]ModelInfo
 		addCandidate(base + "/models")
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := providerHTTPClient(15 * time.Second)
 
 	for _, url := range candidates {
 		httpReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -385,10 +350,10 @@ func fetchOpenAIModels(ctx context.Context, baseURL, apiKey string) ([]ModelInfo
 		if err != nil {
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 		resp.Body.Close()
 
-		if resp.StatusCode >= 400 {
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			continue
 		}
 

@@ -1,10 +1,11 @@
-.PHONY: build run clean docker docker-up docker-down docker-build docker-logs test
+.PHONY: build run clean test vet split-init verify-split docker docker-up docker-down docker-build docker-logs
 
-GOPROXY_FLAGS := GOPROXY=https://goproxy.cn,direct
+COMPOSE = docker compose --env-file deploy/manager-sensor/.env
 
 build:
-	$(GOPROXY_FLAGS) go build -ldflags="-s -w" -o alterhive .
+	go build -ldflags="-s -w" -o alterhive .
 
+# standalone requires explicit ALTERHIVE_ADMIN_TOKEN (>=32 characters).
 run: build
 	./alterhive
 
@@ -12,19 +13,27 @@ clean:
 	rm -f alterhive
 
 test:
-	$(GOPROXY_FLAGS) go test ./...
+	go test -race ./...
+
+vet:
+	go vet ./...
+
+split-init:
+	python3 scripts/init-split.py
 
 docker-build:
-	docker compose build
+	scripts/build-local-image.sh alterhive:split
 
-docker-up:
-	docker compose up -d --build
+verify-split: docker-build
+	scripts/verify-split.sh
+
+docker-up: split-init docker-build
+	$(COMPOSE) up -d
 
 docker-down:
-	docker compose down
+	$(COMPOSE) down
 
 docker-logs:
-	docker compose logs -f
+	$(COMPOSE) logs -f
 
-docker:
-	docker compose build
+docker: docker-build

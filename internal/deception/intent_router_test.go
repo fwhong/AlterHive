@@ -1,12 +1,11 @@
 package deception
 
 import (
-	"time"
 	"testing"
+	"time"
 
 	"github.com/alterhive/alterhive/internal/domain"
 )
-
 
 // awaitIntentCache polls the router cache until the async LLM intent lands
 // (the LLM route is fire-and-forget; Route returns the fast path first).
@@ -59,8 +58,8 @@ func TestIntentRouterAgentUsesLLMForNaturalLanguageGoal(t *testing.T) {
 	if !got.Decision.Triggered || got.Decision.PivotIP != "192.168.56.10" {
 		t.Fatalf("expected sanitized expansion decision with default pivot, got %#v", got.Decision)
 	}
-	if llmClient.requests != 1 {
-		t.Fatalf("expected one LLM request, got %d", llmClient.requests)
+	if llmClient.requests.Load() != 1 {
+		t.Fatalf("expected one LLM request, got %d", llmClient.requests.Load())
 	}
 }
 
@@ -111,8 +110,8 @@ func TestIntentRouterAgentCachesLLMIntent(t *testing.T) {
 	if second.TargetSubnet != "10.77.8.0/24" {
 		t.Fatalf("expected cached subnet on repeated route, second=%#v", second)
 	}
-	if llmClient.requests != 1 {
-		t.Fatalf("expected cached intent to avoid second LLM call, got %d calls", llmClient.requests)
+	if llmClient.requests.Load() != 1 {
+		t.Fatalf("expected cached intent to avoid second LLM call, got %d calls", llmClient.requests.Load())
 	}
 	if second.Source != "intent_cache" {
 		t.Fatalf("expected second route to come from cache, got %#v", second)

@@ -68,7 +68,7 @@ type openAIProvider struct {
 func newOpenAIProvider(cfg ProviderConfig) *openAIProvider {
 	return &openAIProvider{
 		cfg:    cfg,
-		client: &http.Client{Timeout: 120 * time.Second},
+		client: providerHTTPClient(120 * time.Second),
 	}
 }
 
@@ -113,13 +113,13 @@ func (p *openAIProvider) Complete(ctx context.Context, req CompletionRequest) (*
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("API error (%d)", resp.StatusCode)
 	}
 
 	var openAIResp struct {
@@ -215,7 +215,7 @@ type anthropicProvider struct {
 func newAnthropicProvider(cfg ProviderConfig) *anthropicProvider {
 	return &anthropicProvider{
 		cfg:    cfg,
-		client: &http.Client{Timeout: 120 * time.Second},
+		client: providerHTTPClient(120 * time.Second),
 	}
 }
 
@@ -269,13 +269,13 @@ func (p *anthropicProvider) Complete(ctx context.Context, req CompletionRequest)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("API error (%d)", resp.StatusCode)
 	}
 
 	var anthropicResp struct {
@@ -341,9 +341,8 @@ func (p *anthropicProvider) TestConnection(ctx context.Context) error {
 	if resp.StatusCode == http.StatusUnauthorized {
 		return fmt.Errorf("authentication failed (invalid API key)")
 	}
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("API error (%d)", resp.StatusCode)
 	}
 	return nil
 }
@@ -358,7 +357,7 @@ type ollamaProvider struct {
 func newOllamaProvider(cfg ProviderConfig) *ollamaProvider {
 	return &ollamaProvider{
 		cfg:    cfg,
-		client: &http.Client{Timeout: 120 * time.Second},
+		client: providerHTTPClient(120 * time.Second),
 	}
 }
 
@@ -415,13 +414,13 @@ func (p *ollamaProvider) Complete(ctx context.Context, req CompletionRequest) (*
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Ollama API error (%d): %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("Ollama API error (%d)", resp.StatusCode)
 	}
 
 	var ollamaResp struct {
@@ -454,9 +453,12 @@ func (p *ollamaProvider) TestConnection(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("Ollama API error (%d): %s", resp.StatusCode, string(body))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Ollama API error (%d)", resp.StatusCode)
 	}
 	return nil
+}
+
+func providerHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }

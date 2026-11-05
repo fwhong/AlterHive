@@ -21,7 +21,6 @@ func (f fakeLLMClient) Complete(context.Context, llm.CompletionRequest) (*llm.Co
 	return &llm.CompletionResponse{Content: f.content}, nil
 }
 
-
 // awaitCachedOutput polls the world rule cache until the async decision
 // result lands there. The LLM fallback is fire-and-forget: the first
 // HandleCommand returns the deterministic shellLikeFallback output, and the
@@ -31,6 +30,7 @@ func awaitCachedOutput(t *testing.T, cmd string, session *domain.SessionContext,
 	key := buildCacheKey(cmd, session.CWD)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
+		session.ApplyPending()
 		if cached := world.Cache().Lookup(key); cached != nil {
 			return cached.Output
 		}
@@ -46,7 +46,8 @@ func awaitLLMEvent(t *testing.T, session *domain.SessionContext, prefix string) 
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		for _, ev := range session.EventLog {
+		session.ApplyPending()
+		for _, ev := range session.Events() {
 			if ev.Type == "llm_fallback" && strings.HasPrefix(ev.Detail, prefix) {
 				return true
 			}
@@ -60,6 +61,7 @@ func awaitLLMEvent(t *testing.T, session *domain.SessionContext, prefix string) 
 func assertNotCached(t *testing.T, cmd string, session *domain.SessionContext, world *domain.WorldState) {
 	t.Helper()
 	time.Sleep(200 * time.Millisecond)
+	session.ApplyPending()
 	if cached := world.Cache().Lookup(buildCacheKey(cmd, session.CWD)); cached != nil {
 		t.Fatalf("expected blocked decision not to be cached, got %q", cached.Output)
 	}
@@ -109,7 +111,7 @@ func TestHandleCommandRoutesHighValueShellCommands(t *testing.T) {
 	}{
 		{name: "curl", command: "curl http://192.168.56.23", want: "HTTP/1.1 200 OK"},
 		{name: "ssh", command: "ssh root@192.168.56.60", want: "password:"},
-		{name: "mysql", command: "mysql -h 192.168.56.60 -u web_ro -pWebApp@2024!Ro", want: "ERROR 1045"},
+		{name: "mysql", command: "mysql -h 192.168.56.60 -u web_ro", want: "ERROR 1045"},
 	}
 
 	for _, tt := range tests {
@@ -336,6 +338,7 @@ func TestComplexCommandFallsBackToRuleEngineWhenLLMEmpty(t *testing.T) {
 }
 
 func TestComplexCommandLLMAuthorsResponseWhenAvailable(t *testing.T) {
+	t.Setenv("ALTERHIVE_ALLOW_LLM_CONTEXT_EXPORT", "true")
 	topology := testTopology()
 	session := domain.NewSessionContext("agent", "127.0.0.1:4444")
 	world := domain.NewWorldState()
@@ -347,8 +350,13 @@ func TestComplexCommandLLMAuthorsResponseWhenAvailable(t *testing.T) {
 	if !strings.Contains(got, "Nmap scan report") {
 		t.Fatalf("expected LLM-authored nmap output, got %q", got)
 	}
+	if llmGenerated {
+		t.Fatal("initial deterministic response must not be marked LLM generated")
+	}
+	awaitCachedOutput(t, "nmap -sV 192.168.56.60", session, world)
+	got, _, llmGenerated = engine.HandleCommand("nmap -sV 192.168.56.60", session, world, false)
 	if !llmGenerated {
-		t.Fatal("expected llmGenerated=true for LLM-authored complex command")
+		t.Fatal("cached LLM response must be marked generated")
 	}
 	if !strings.Contains(got, "3306/tcp") {
 		t.Fatalf("expected port 3306 in LLM output, got %q", got)
@@ -433,5 +441,14 @@ func TestPPFUnlocksJenkinsFakeSuccess(t *testing.T) {
 	got, _, _ := engine.HandleCommand("curl http://192.168.56.45:8080/job/webapp-deploy/lastBuild/consoleText", session, world, true)
 	if !strings.Contains(got, "Finished: SUCCESS") {
 		t.Fatalf("expected PPF Jenkins console success, got %q", got)
+	}
+}
+
+func TestMySQLSimulationPasswordPathStillWorks(t *testing.T) {
+	e := NewRuleEngine(testTopology(), domain.NewSafetyPolicy("192.168.56.0/24"), nil)
+	s := domain.NewSessionContext("agent", "127.0.0.1:1")
+	out, _, _ := e.HandleCommand("mysql -h 192.168.56.60 -u web_ro -pSYNTHETIC", s, domain.NewWorldState(), false)
+	if !strings.Contains(out, "Welcome to the MySQL monitor") {
+		t.Fatalf("password simulation regression: %s", out)
 	}
 }

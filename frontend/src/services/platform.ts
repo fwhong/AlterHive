@@ -1,4 +1,4 @@
-import { api, ApiResponse, fetchHealth, fetchSystemInfo } from "./api";
+import { api, managerApi, ApiResponse, fetchHealth, fetchSystemInfo } from "./api";
 import type {
   CommandRow,
   DashboardSummary,
@@ -117,47 +117,39 @@ export async function fetchRuntimeUpdateStatus() {
 // --- LLM Provider Management ---
 
 export async function fetchLLMActive() {
-  const response = await api.get<ApiResponse<LLMActiveInfo>>("/api/v1/llm/active");
+  const response = await managerApi.get<ApiResponse<LLMActiveInfo>>("/api/v1/llm/active");
   return response.data.data;
 }
 
 export async function fetchLLMProviders() {
-  const response = await api.get<ApiResponse<LLMProvider[]>>("/api/v1/llm/providers");
+  const response = await managerApi.get<ApiResponse<LLMProvider[]>>("/api/v1/llm/providers");
   return response.data.data;
 }
 
 export async function switchLLMProvider(id: string) {
-  const response = await api.post<ApiResponse<null>>(`/api/v1/llm/switch/${id}`);
+  const response = await managerApi.post<ApiResponse<null>>(`/api/v1/llm/switch/${id}`);
   return response.data;
 }
 
 export async function setLLMEnabled(enabled: boolean) {
-  const response = await api.put<ApiResponse<null>>("/api/v1/llm/enabled", { enabled });
+  const response = await managerApi.put<ApiResponse<null>>("/api/v1/llm/enabled", { enabled });
   return response.data;
 }
 
 export async function updateLLMProvider(id: string, config: Partial<LLMProvider>) {
-  const response = await api.put<ApiResponse<null>>(`/api/v1/llm/providers/${id}`, config);
+  const response = await managerApi.put<ApiResponse<null>>(`/api/v1/llm/providers/${id}`, config);
   return response.data;
 }
 
-export async function testLLMProvider(id: string, baseUrl?: string, apiKey?: string) {
-  const params = new URLSearchParams();
-  if (baseUrl) params.set("base_url", baseUrl);
-  if (apiKey) params.set("api_key", apiKey);
-  const qs = params.toString();
-  const url = `/api/v1/llm/test/${id}${qs ? "?" + qs : ""}`;
-  const response = await api.post<ApiResponse<{ provider: string; status: string }>>(url);
+export async function testLLMProvider(id: string) {
+  const url = `/api/v1/llm/test/${encodeURIComponent(id)}`;
+  const response = await managerApi.post<ApiResponse<{ provider: string; status: string }>>(url);
   return response.data;
 }
 
-export async function fetchProviderModels(id: string, baseUrl?: string, apiKey?: string): Promise<ModelInfo[]> {
-  const params = new URLSearchParams();
-  if (baseUrl) params.set("base_url", baseUrl);
-  if (apiKey) params.set("api_key", apiKey);
-  const qs = params.toString();
-  const url = `/api/v1/llm/providers/${id}/models${qs ? "?" + qs : ""}`;
-  const response = await api.get<ApiResponse<ModelInfo[]>>(url);
+export async function fetchProviderModels(id: string): Promise<ModelInfo[]> {
+  const url = `/api/v1/llm/providers/${encodeURIComponent(id)}/models`;
+  const response = await managerApi.get<ApiResponse<ModelInfo[]>>(url);
   if (response.data.ok) {
     return response.data.data;
   }

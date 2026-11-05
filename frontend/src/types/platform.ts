@@ -146,6 +146,7 @@ export interface SessionDetail {
 }
 
 export interface RuntimeConfig {
+  read_only?: boolean;
   honeypot: {
     ssh_port: number;
     api_port: number;
@@ -172,11 +173,13 @@ export interface RuntimeUpdateStatus {
 }
 
 export interface LLMProvider {
+  key_configured?: boolean;
   id: string;
   name: string;
   type: string;
   base_url: string;
   api_key: string;
+  key_env?: string;
   model: string;
   max_tokens: number;
   temperature: number;
@@ -184,6 +187,7 @@ export interface LLMProvider {
 }
 
 export interface LLMActiveInfo {
+  read_only?: boolean;
   active_provider: string;
   enabled: boolean;
   is_active: boolean;

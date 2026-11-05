@@ -80,6 +80,7 @@ type PlanBreadcrumb struct {
 
 // TopologyPlanner runs a fast deterministic planner and an optional async LLM planner.
 type TopologyPlanner struct {
+	safety   *domain.SafetyPolicy
 	decider  DecisionClient
 	topology *domain.VirtualTopology
 	mu       sync.Mutex
@@ -257,6 +258,9 @@ func (p *TopologyPlanner) MergePlan(session *domain.SessionContext, plan Topolog
 	for _, segment := range plan.Segments {
 		segment.OwnerSessionID = session.SessionID
 		p.topology.AppendSegment(segment)
+		if p.safety != nil {
+			p.safety.AllowCIDR(segment.CIDR)
+		}
 	}
 	for _, edge := range plan.Edges {
 		edge.OwnerSessionID = session.SessionID
@@ -462,6 +466,7 @@ func (p *TopologyPlanner) scheduleLLMPlan(session *domain.SessionContext, comman
 	p.inflight[key] = true
 	p.mu.Unlock()
 
+	req := DecisionRequest{SessionID: session.SessionID, CallSite: SiteTopologyPlan, Command: command, UserContent: buildPlannerUserPrompt(session, p.topology, command, profile)}
 	go func() {
 		defer func() {
 			p.mu.Lock()
@@ -472,7 +477,10 @@ func (p *TopologyPlanner) scheduleLLMPlan(session *domain.SessionContext, comman
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
-		plan, err := p.llmPlan(ctx, session, command, profile)
+		resp, err := p.decider.Decide(ctx, req)
+		if err == nil && resp.Plan == nil {
+			err = fmt.Errorf("empty plan response")
+		}
 		if err != nil {
 			session.AppendEvent(domain.EventEntry{
 				Type:      "topology_plan_failed",
@@ -482,7 +490,41 @@ func (p *TopologyPlanner) scheduleLLMPlan(session *domain.SessionContext, comman
 			})
 			return
 		}
+		plan := *resp.Plan
+		if plan.PlanID == "" {
+			plan.PlanID = "llm_planner:" + command
+		}
+		session.QueueMutation(func() { p.acceptAsyncPlan(session, req, plan, true) })
+	}()
+}
+
+// acceptAsyncPlan runs only under the session command lock. Rejected plans get
+// one asynchronous repair attempt against the frozen original request; repaired
+// plans are revalidated on the next hot path and can never bypass the guards.
+func (p *TopologyPlanner) acceptAsyncPlan(session *domain.SessionContext, original DecisionRequest, plan DeceptionPlan, repair bool) {
+	candidate, err := filterProtectedTargets(sanitizePlan(plan.ToTopologyPlan()), session)
+	if err == nil {
+		err = ValidateTopologyPlan(candidate, p.topology)
+	}
+	if err == nil {
 		p.MergeDeceptionPlan(session, plan)
+		return
+	}
+	session.AppendEvent(domain.EventEntry{Type: "topology_plan_rejected", SessionID: session.SessionID, Detail: err.Error(), Timestamp: time.Now().UTC().Format(time.RFC3339)})
+	if !repair || decisionClientInactive(p.decider) {
+		return
+	}
+	payload, _ := json.Marshal(map[string]interface{}{"feedback": err.Error(), "rejected_plan": plan, "original_input": original.UserContent})
+	req := DecisionRequest{SessionID: original.SessionID, CallSite: SitePlanRepair, Command: original.Command, UserContent: string(payload)}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), DecisionTimeoutFor(SitePlanRepair))
+		defer cancel()
+		resp, err := p.decider.Decide(ctx, req)
+		if err != nil || resp.Plan == nil {
+			return
+		}
+		repaired := *resp.Plan
+		session.QueueMutation(func() { p.acceptAsyncPlan(session, original, repaired, false) })
 	}()
 }
 

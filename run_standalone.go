@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,6 +26,7 @@ import (
 // its own LLM config and wraps it into a local decision client, so the
 // decision path is identical to the split deployment by construction.
 func runStandalone() {
+	requireAdminToken()
 	configDir := resolveConfigDir()
 
 	topology, safety := loadTopology(configDir)
@@ -50,7 +52,10 @@ func loadLocalLLM(configDir string) *llm.Manager {
 	llmConfigPath := filepath.Join(configDir, "llm.yaml")
 	llmConfig, err := llm.LoadLLMConfig(llmConfigPath)
 	if err != nil {
-		log.WithError(err).Warn("Failed to load LLM config, LLM features disabled")
+		if !os.IsNotExist(err) {
+			log.Fatal("invalid LLM configuration; fix configuration before startup")
+		}
+		log.Info("No LLM config, LLM features disabled")
 		llmConfig = &llm.LLMConfig{Providers: []llm.ProviderConfig{}}
 	}
 	llmMgr := llm.NewManager(llmConfig, llmConfigPath)
@@ -65,9 +70,6 @@ func loadLocalLLM(configDir string) *llm.Manager {
 
 func resolveConfigDir() string {
 	configDir := getEnv("CONFIG_DIR", "configs")
-	if _, err := os.Stat(configDir); os.IsNotExist(err) {
-		configDir = "/app/configs" // Docker fallback
-	}
 	return configDir
 }
 
@@ -152,17 +154,20 @@ func startHoneypotAPI(mgr *session.Manager, llmMgr *llm.Manager, apiAddr string)
 	apiServer := api.NewServer(mgr, llmMgr)
 	apiServer.RegisterRoutes(router)
 
+	listener, err := net.Listen("tcp", apiAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	serveHTTP(listener, router)
 	log.WithField("api", apiAddr).Info("API server started")
-	go func() {
-		if err := http.ListenAndServe(apiAddr, router); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("API server error: %v", err)
-		}
-	}()
 }
 
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
+		if origin := os.Getenv("ALTERHIVE_CORS_ORIGIN"); origin != "" && origin == c.GetHeader("Origin") {
+			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Vary", "Origin")
+		}
 		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		if c.Request.Method == http.MethodOptions {

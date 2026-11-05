@@ -49,8 +49,8 @@ type TerminalRenderInput struct {
 	CWD      string `json:"cwd"`
 
 	// Complex-render only.
-	Seed         int `json:"seed"`
-	ScanVariant  int `json:"scan_variant"`
+	Seed            int    `json:"seed"`
+	ScanVariant     int    `json:"scan_variant"`
 	StructuredFacts string `json:"structured_facts,omitempty"`
 
 	TopologyContext  string `json:"topology_context"`
@@ -63,10 +63,10 @@ type TerminalRenderInput struct {
 // state-derived prompt body the sensor serializes from its own session,
 // world and topology state.
 type DecisionRequest struct {
-	SessionID   string              `json:"session_id"`
-	CallSite    CallSite            `json:"call_site"`
-	Command     string              `json:"command"`
-	UserContent string              `json:"user_content"`
+	SessionID   string               `json:"session_id"`
+	CallSite    CallSite             `json:"call_site"`
+	Command     string               `json:"command"`
+	UserContent string               `json:"user_content"`
 	Terminal    *TerminalRenderInput `json:"terminal,omitempty"`
 }
 
@@ -98,9 +98,6 @@ func decisionClientInactive(client DecisionClient) bool {
 	if client == nil {
 		return true
 	}
-	if _, ok := client.(*LocalDecisionClient); ok {
-		return false
-	}
 	return !client.IsActive()
 }
 
@@ -127,13 +124,16 @@ func NewLocalDecisionClient(client CompletionClient) DecisionClient {
 }
 
 func (l *LocalDecisionClient) IsActive() bool {
-	if l == nil || l.llm == nil {
+	if l == nil || l.llm == nil || !allowLLMContextExport() {
 		return false
 	}
-	return l.llm.IsActive()
+	return !completionClientInactive(l.llm)
 }
 
 func (l *LocalDecisionClient) Decide(ctx context.Context, req DecisionRequest) (DecisionResponse, error) {
+	if !allowLLMContextExport() {
+		return DecisionResponse{}, fmt.Errorf("LLM context export disabled")
+	}
 	resp := Decide(ctx, l.llm, req)
 	if !resp.OK {
 		return resp, fmt.Errorf("decision %s: %s", req.CallSite, resp.Error)

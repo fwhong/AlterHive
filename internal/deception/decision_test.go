@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -69,7 +72,7 @@ func TestDecisionRequestJSONRoundTrip(t *testing.T) {
 	}
 
 	resp := DecisionResponse{
-		OK:     true,
+		OK:      true,
 		Content: "output",
 		Intent:  &IntentResult{IntentType: "finance_hunt", Source: "llm_intent_router"},
 	}
@@ -206,65 +209,59 @@ func TestAsDecisionClientNil(t *testing.T) {
 	}
 }
 
-func TestRemoteDecisionClientAuthAndErrors(t *testing.T) {
-	const token = "secret-token"
-
-	// Manager stub: requires the bearer token, echoes a decision response.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/decide" {
-			http.NotFound(w, r)
-			return
+func unixDecisionTestServer(t *testing.T, h http.Handler) (*RemoteDecisionClient, *httptest.Server) {
+	t.Helper()
+	t.Setenv("ALTERHIVE_ALLOW_LLM_CONTEXT_EXPORT", "true")
+	// macOS Unix paths must remain shorter than sockaddr_un.sun_path.
+	dir, err := os.MkdirTemp("", "ah-uds-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	path := filepath.Join(dir, "decision.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewUnstartedServer(h)
+	srv.Listener = ln
+	srv.Start()
+	t.Cleanup(srv.Close)
+	client, err := NewRemoteDecisionClient(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Close)
+	return client, srv
+}
+func TestRemoteDecisionClientUnixAndBackoff(t *testing.T) {
+	remote, srv := unixDecisionTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			t.Error("sensor sent credential")
 		}
-		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		var req DecisionRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(DecisionResponse{OK: true, Content: "remote output"})
+		json.NewEncoder(w).Encode(DecisionResponse{OK: true, Content: "remote output"})
 	}))
-	defer srv.Close()
-
-	remote := NewRemoteDecisionClient(srv.URL, token)
-	if !remote.IsActive() {
-		t.Fatal("expected active remote client")
-	}
-
-	resp, err := remote.Decide(context.Background(), DecisionRequest{
-		CallSite:    SiteLLMFallback,
-		UserContent: "body",
-	})
+	resp, err := remote.Decide(context.Background(), DecisionRequest{CallSite: SiteLLMFallback})
 	if err != nil || resp.Content != "remote output" {
-		t.Fatalf("expected remote output, got resp=%#v err=%v", resp, err)
+		t.Fatalf("%+v %v", resp, err)
 	}
-
-	// Wrong token must fail and trip the backoff.
-	bad := NewRemoteDecisionClient(srv.URL, "wrong")
-	if _, err := bad.Decide(context.Background(), DecisionRequest{CallSite: SiteLLMFallback}); err == nil {
-		t.Fatal("expected auth failure")
+	srv.Close()
+	remote.Close()
+	if _, err := remote.Decide(context.Background(), DecisionRequest{CallSite: SiteLLMFallback}); err == nil {
+		t.Fatal("expected connectivity failure")
 	}
-	if bad.IsActive() {
-		t.Fatal("expected backoff after failure")
-	}
-
-	// Unreachable manager surfaces a transport error.
-	dead := NewRemoteDecisionClient("http://127.0.0.1:1", token)
-	if _, err := dead.Decide(context.Background(), DecisionRequest{CallSite: SiteLLMFallback}); err == nil {
-		t.Fatal("expected transport error")
+	if remote.IsActive() {
+		t.Fatal("expected backoff")
 	}
 }
 
 func TestRemoteDecisionClientHonorsContextDeadline(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	remote, srv := unixDecisionTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(300 * time.Millisecond)
 		_ = json.NewEncoder(w).Encode(DecisionResponse{OK: true})
 	}))
 	defer srv.Close()
 
-	remote := NewRemoteDecisionClient(srv.URL, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	started := time.Now()
@@ -310,5 +307,50 @@ func TestSanitizeTerminalOutputMoved(t *testing.T) {
 	got := SanitizeTerminalOutput("```bash\nreal line\n```\nAs an AI model disclaimer")
 	if strings.Contains(got, "```") || strings.Contains(got, "As an AI") {
 		t.Fatalf("expected fences and disclaimers stripped, got %q", got)
+	}
+}
+
+func TestContextExportGateBlocksEverySiteBeforeTransport(t *testing.T) {
+	t.Setenv("ALTERHIVE_ALLOW_LLM_CONTEXT_EXPORT", "false")
+	localBackend := &fakeDecideLLM{active: true}
+	local := AsDecisionClient(localBackend)
+	remote, err := NewRemoteDecisionClient("/nonexistent/manager.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	for _, site := range []CallSite{SiteComplexRender, SiteLLMFallback, SiteWorldPatch, SiteIntentRoute, SiteTopologyPlan, SiteDeceptionPlan, SitePlanRepair} {
+		for _, client := range []DecisionClient{local, remote} {
+			if client.IsActive() {
+				t.Fatal("disabled export still active")
+			}
+			if _, err := client.Decide(context.Background(), DecisionRequest{CallSite: site}); err == nil || !strings.Contains(err.Error(), "export disabled") {
+				t.Fatalf("site %s: %v", site, err)
+			}
+		}
+	}
+	if localBackend.requests != 0 || !remote.lastFailed.IsZero() {
+		t.Fatal("disabled export reached backend/transport")
+	}
+}
+
+func TestManagerThrottlingIsNotConnectivityFailure(t *testing.T) {
+	remote, srv := unixDecisionTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	defer remote.Close()
+	if _, err := remote.Decide(context.Background(), DecisionRequest{CallSite: SiteLLMFallback}); err == nil {
+		t.Fatal("expected throttled error")
+	}
+	if !remote.lastFailed.IsZero() || remote.IsActive() {
+		t.Fatal("wrong throttling state")
+	}
+	remote.mu.Lock()
+	remote.retryAfter = time.Now().Add(-time.Second)
+	remote.mu.Unlock()
+	if !remote.IsActive() {
+		t.Fatal("rate limited client stuck in 30 second connectivity backoff")
 	}
 }

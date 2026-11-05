@@ -12,12 +12,14 @@ const banner = "\n  AlterHive v3.0 - Honeypot for Adversarial AI Agents (Go)\n\n
 //	standalone (default) — single-process honeypot: local LLM decisions, no split
 //	sensor               — honeypot without LLM credentials; cold-path decisions
 //	                       are forwarded to the central manager
+//	ingress              — TCP front door forwarding only to sensor Unix sockets
 //	manager              — central decision service: holds LLM providers/keys,
 //	                       answers sensor decisions, exposes LLM admin API
 const (
 	RoleStandalone = "standalone"
 	RoleSensor     = "sensor"
 	RoleManager    = "manager"
+	RoleIngress    = "ingress"
 )
 
 func main() {
@@ -30,8 +32,13 @@ func main() {
 		runManager()
 	case RoleSensor:
 		runSensor()
-	default:
+	case RoleIngress:
+		runIngress()
+	case RoleStandalone:
 		runStandalone()
+	default:
+		fmt.Fprintln(os.Stderr, "invalid ALTERHIVE_ROLE")
+		os.Exit(1)
 	}
 }
 

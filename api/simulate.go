@@ -76,13 +76,13 @@ type SimResponse struct {
 // This replaces the old applySimEvidence + direct responder calls so the
 // simulation API gets the exact same treatment as interactive SSH traffic.
 func (s *Server) dispatchSim(session *domain.SessionContext, cmd string) string {
-	s.manager.PlanTopology(session, cmd)
 	output := s.manager.DispatchCommand(session.SessionID, cmd)
 	return output
 }
 
 // buildSimResponse creates a SimResponse with deception fields.
 func buildSimResponse(session *domain.SessionContext, output string, evidenceHits []string) SimResponse {
+	session = session.SnapshotForAPI()
 	return SimResponse{
 		OK:               true,
 		Output:           output,
@@ -215,6 +215,7 @@ func (s *Server) simGoal(c *gin.Context) {
 		return
 	}
 
+	session.LockCommand()
 	injected := deception.InjectGoalTopology(session, s.manager.TopologyRef(), s.manager.SafetyRef(), goal)
 	if injected {
 		session.AppendEvent(domain.EventEntry{
@@ -231,6 +232,7 @@ func (s *Server) simGoal(c *gin.Context) {
 			Detail:    fmt.Sprintf("Goal observed via API: %s → %s", goal.Raw, goal.CIDR),
 		})
 	}
+	session.UnlockCommand()
 	s.manager.PlanTopology(session, req.Target)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -254,7 +256,7 @@ func (s *Server) simGoal(c *gin.Context) {
 // simSessionStatus returns the current state of a simulation session.
 func (s *Server) simSessionStatus(c *gin.Context) {
 	sessionID := c.Param("id")
-	sess := s.manager.GetSession(sessionID)
+	sess := s.manager.SessionView(sessionID)
 	if sess == nil {
 		c.JSON(http.StatusNotFound, gin.H{"ok": false, "message": "Session not found"})
 		return
@@ -307,7 +309,6 @@ func (s *Server) getOrCreateSimSession(sessionID string) *domain.SessionContext 
 }
 
 func (s *Server) expandSimTopology(session *domain.SessionContext, cmd string) {
-	s.manager.PlanTopology(session, cmd)
 }
 
 func itoa(n int) string {

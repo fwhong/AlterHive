@@ -69,18 +69,31 @@ func (p *DeceptionPlannerAgent) Plan(ctx context.Context, session *domain.Sessio
 // PlanAsync schedules LLM planning in the background and calls the callback
 // when complete. This is the primary integration point for the Cold Path.
 func (p *DeceptionPlannerAgent) PlanAsync(session *domain.SessionContext, intent IntentResult, event PlanningEvent, callback func(DeceptionPlan, error)) {
-	if p == nil || !p.IsActive() {
+	if p == nil || !p.IsActive() || session == nil {
 		if callback != nil {
 			callback(DeceptionPlan{}, fmt.Errorf("planner not active"))
 		}
 		return
 	}
 
+	req := DecisionRequest{SessionID: session.SessionID, CallSite: SiteDeceptionPlan, Command: buildPlannerCommand(intent, event), UserContent: buildPlannerUserPrompt(session, p.topology, buildPlannerCommand(intent, event), ProfileFromSession(session))}
+	phase := "recon"
+	if session.Planning != nil {
+		phase = session.Planning.CurrentPhase
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
-		plan, err := p.Plan(ctx, session, intent, event)
+		resp, err := p.decider.Decide(ctx, req)
+		var plan DeceptionPlan
+		if err == nil {
+			if resp.Plan == nil {
+				err = fmt.Errorf("empty plan response")
+			} else {
+				plan = p.enrichPlan(*resp.Plan, intent, event, &domain.SessionContext{Planning: &domain.PlanningState{CurrentPhase: phase}})
+			}
+		}
 		if callback != nil {
 			callback(plan, err)
 		}

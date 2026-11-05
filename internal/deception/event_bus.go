@@ -1,6 +1,7 @@
 package deception
 
 import (
+	"github.com/alterhive/alterhive/internal/domain"
 	"sync"
 	"time"
 )
@@ -28,6 +29,8 @@ const (
 
 // PlanningEvent carries the trigger for a potential replanning cycle.
 type PlanningEvent struct {
+	// Session is consumed synchronously to freeze request data before dispatch.
+	Session   *domain.SessionContext
 	Type      PlanningEventType
 	SessionID string
 	Command   string

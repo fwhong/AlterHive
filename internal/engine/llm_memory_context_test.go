@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 // capturingLLMClient records the system prompt sent to the LLM so tests can
 // assert that the L0/L1/L2 layered memory context was injected.
 type capturingLLMClient struct {
+	mu           sync.Mutex
 	active       bool
 	content      string
 	systemPrompt string
@@ -21,6 +23,8 @@ type capturingLLMClient struct {
 func (f *capturingLLMClient) IsActive() bool { return f.active }
 
 func (f *capturingLLMClient) Complete(ctx context.Context, req llm.CompletionRequest) (*llm.CompletionResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.systemPrompt = ""
 	for _, msg := range req.Messages {
 		if msg.Role == "system" {
@@ -30,14 +34,16 @@ func (f *capturingLLMClient) Complete(ctx context.Context, req llm.CompletionReq
 	return &llm.CompletionResponse{Content: f.content}, nil
 }
 
-
 // awaitSystemPrompt polls until the async decision call reaches the
 // capturing completion client with a system prompt.
 func awaitSystemPrompt(t *testing.T, client *capturingLLMClient) string {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if prompt := client.systemPrompt; prompt != "" {
+		client.mu.Lock()
+		prompt := client.systemPrompt
+		client.mu.Unlock()
+		if prompt != "" {
 			return prompt
 		}
 		time.Sleep(10 * time.Millisecond)

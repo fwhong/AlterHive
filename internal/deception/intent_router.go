@@ -86,15 +86,19 @@ func (r *IntentRouterAgent) Route(event CommandEvent, session *domain.SessionCon
 	// Fire async LLM call to enrich future routing decisions.
 	// Return the rule-based fast-path result immediately so the
 	// terminal stays responsive.
-	go r.routeAsync(cacheKey, event, session, fast)
+	req := DecisionRequest{SessionID: event.SessionID, CallSite: SiteIntentRoute, Command: event.Command, UserContent: buildIntentRouterUserPrompt(event, session, fast, r.topology)}
+	go r.routeAsync(cacheKey, event, session, req)
 
 	return fast
 }
 
-func (r *IntentRouterAgent) routeAsync(cacheKey string, event CommandEvent, session *domain.SessionContext, fast IntentResult) {
+func (r *IntentRouterAgent) routeAsync(cacheKey string, event CommandEvent, session *domain.SessionContext, req DecisionRequest) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	llmIntent, err := r.routeWithLLM(ctx, event, session, fast)
+	resp, err := r.decider.Decide(ctx, req)
+	if err == nil && resp.Intent == nil {
+		err = fmt.Errorf("empty intent response")
+	}
 	if err != nil {
 		if session != nil {
 			session.AppendEvent(domain.EventEntry{
@@ -106,7 +110,7 @@ func (r *IntentRouterAgent) routeAsync(cacheKey string, event CommandEvent, sess
 		}
 		return
 	}
-	r.store(cacheKey, llmIntent)
+	r.store(cacheKey, *resp.Intent)
 }
 
 func (r *IntentRouterAgent) shouldAskLLM(command string, fast IntentResult) bool {

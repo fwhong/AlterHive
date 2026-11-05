@@ -44,3 +44,9 @@ coverage.txt
 # Temp files
 *.tmp
 *.bak
+
+# Split runtime configuration and operator secrets (never shared with sensor).
+deploy/manager-sensor/.env
+deploy/manager-sensor/manager.env
+deploy/manager-sensor/manager-configs/
+deploy/manager-sensor/sensor-configs/

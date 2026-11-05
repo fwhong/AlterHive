@@ -38,6 +38,7 @@ export function saveUser(user: CurrentUser) {
 
 export function clearSession() {
   localStorage.removeItem(TOKEN_KEY);
+  sessionStorage.removeItem("alterhive_manager_token");
   localStorage.removeItem(USER_KEY);
 }
 

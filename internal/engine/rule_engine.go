@@ -8,6 +8,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alterhive/alterhive/internal/deception"
@@ -24,9 +25,11 @@ var (
 
 // RuleEngine routes commands to appropriate responders.
 type RuleEngine struct {
-	Topology *domain.VirtualTopology
-	Safety   *domain.SafetyPolicy
-	Registry *domain.ServiceRegistry
+	decisionMu sync.Mutex
+	inflight   map[string]bool
+	Topology   *domain.VirtualTopology
+	Safety     *domain.SafetyPolicy
+	Registry   *domain.ServiceRegistry
 	// Decider is the cold-path decision surface. Standalone mode wraps the
 	// in-process llm.Manager; sensor mode gets a remote decision client.
 	Decider deception.DecisionClient
@@ -66,6 +69,8 @@ func (e *RuleEngine) SetDecider(decider deception.DecisionClient) {
 
 // HandleCommand processes a command and returns (output, evidence_hits, llm_generated).
 func (e *RuleEngine) HandleCommand(cmd string, session *domain.SessionContext, world *domain.WorldState, ppfTriggered bool) (string, []string, bool) {
+	session.ApplyPending()
+
 	cmdStripped := strings.TrimSpace(cmd)
 	if cmdStripped == "" {
 		return "", nil, false
@@ -91,8 +96,8 @@ func (e *RuleEngine) HandleCommand(cmd string, session *domain.SessionContext, w
 	// context. The rule engine remains the deterministic fallback so the system
 	// still works when LLM is unavailable or returns nothing usable.
 	if isComplexCommand(cmdBase) {
-		if out, hits := e.handleComplexViaLLM(cmdStripped, cmdBase, session, world, ppfTriggered); out != "" {
-			return e.renderApproved(cmdStripped, out, session), hits, true
+		if out, hits, generated := e.handleComplexViaLLM(cmdStripped, cmdBase, session, world, ppfTriggered); out != "" {
+			return e.renderApproved(cmdStripped, out, session), hits, generated
 		}
 	}
 
@@ -177,7 +182,7 @@ func (e *RuleEngine) HandleCommand(cmd string, session *domain.SessionContext, w
 	// Check dynamic rule cache before calling LLM
 	cacheKey := buildCacheKey(cmdStripped, session.CWD)
 	if cached := world.Cache().Lookup(cacheKey); cached != nil {
-		return e.renderApproved(cmdStripped, cached.Output, session), nil, false
+		return e.renderApproved(cmdStripped, cached.Output, session), nil, true
 	}
 
 	if output := e.llmFallback(cmdStripped, session, world); output != "" {
@@ -220,38 +225,41 @@ func isComplexCommand(cmdBase string) bool {
 // and fires an async LLM call whose result is cached for subsequent invocations.
 // Returns ("", nil) only when the LLM is unavailable, in which case
 // HandleCommand falls through to the rule-engine switch.
-func (e *RuleEngine) handleComplexViaLLM(cmd, cmdBase string, session *domain.SessionContext, world *domain.WorldState, ppfTriggered bool) (string, []string) {
+func (e *RuleEngine) handleComplexViaLLM(cmd, cmdBase string, session *domain.SessionContext, world *domain.WorldState, ppfTriggered bool) (string, []string, bool) {
 	if decisionClientNil(e.Decider) {
-		return "", nil
+		return "", nil, false
 	}
 
 	ruleOutput, evidenceHits := e.ruleEngineDispatch(cmd, cmdBase, session, world, ppfTriggered)
 	if !allowLLMContextExport() {
-		return ruleOutput, evidenceHits
+		return ruleOutput, evidenceHits, false
 	}
 
 	// Check cache first — if the LLM already authored a response for this
 	// command, return it immediately (fast path).
 	cacheKey := buildCacheKey(cmd, session.CWD)
 	if cached := world.Cache().Lookup(cacheKey); cached != nil {
-		return cached.Output, evidenceHits
+		return cached.Output, evidenceHits, true
 	}
 
 	// Fire async LLM call to enrich future responses. The deterministic
 	// rule-engine output is returned instantly so the terminal stays snappy.
-	go e.handleComplexAsync(cmd, cmdBase, session, world, ruleOutput)
+	e.handleComplexAsync(cmd, cmdBase, session, world, ruleOutput)
 
-	return ruleOutput, evidenceHits
+	return ruleOutput, evidenceHits, false
 }
 
 // handleComplexAsync asks the decision side to author a richer variant of the
 // deterministic output and caches the result so subsequent invocations of the
 // same command use the LLM-authored output.
 func (e *RuleEngine) handleComplexAsync(cmd, cmdBase string, session *domain.SessionContext, world *domain.WorldState, ruleOutput string) {
+	key := session.SessionID + "|" + session.CWD + "|complex|" + cmd
+	if !e.beginDecision(key) {
+		return
+	}
 	structuredFacts := formatStructuredFacts(cmd, cmdBase, ruleOutput, session, e.Topology)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
 
 	profile := deception.ProfileFromSession(session)
 	decision := deception.SelectStrategy(profile, session)
@@ -285,34 +293,40 @@ func (e *RuleEngine) handleComplexAsync(cmd, cmdBase string, session *domain.Ses
 		},
 	}
 
-	resp, err := e.Decider.Decide(ctx, req)
-	if err != nil {
-		recordLLMFallbackEvent(session, "complex_complete_error:"+err.Error(), cmd)
-		return
-	}
-	output := resp.Content
-	if output == "" {
-		recordLLMFallbackEvent(session, "complex_empty_after_sanitize", cmd)
-		return
-	}
-	guarded := deception.GuardTerminalOutput(output, session)
-	if guarded.Blocked {
-		recordLLMFallbackEvent(session, "complex_terminal_guard:"+guarded.Reason, cmd)
-		return
-	}
-	factGuarded := deception.GuardResponseFacts(guarded.Output, session, e.Topology)
-	if factGuarded.Blocked {
-		recordLLMFallbackEvent(session, "complex_fact_guard:"+factGuarded.Reason, cmd)
-		return
-	}
-	// Cache the LLM-rendered output for consistency on repeat commands.
-	storeAndInject(cmd, factGuarded.Output, world, session.CWD)
-	// Bump world version to invalidate Manager's planning response cache,
-	// so subsequent invocations reach HandleCommand → world cache → LLM output.
-	if session.Planning != nil {
-		session.Planning.BumpWorldVersion("llm_async_cached:" + cmdBase)
-	}
-	recordLLMFallbackEvent(session, "complex_llm_authored", cmd)
+	go func() {
+		defer e.endDecision(key)
+		defer cancel()
+		resp, err := e.Decider.Decide(ctx, req)
+		if err != nil {
+			recordLLMFallbackEvent(session, "complex_complete_error:"+err.Error(), cmd)
+			return
+		}
+		session.QueueMutation(func() {
+			output := resp.Content
+			if output == "" {
+				recordLLMFallbackEvent(session, "complex_empty_after_sanitize", cmd)
+				return
+			}
+			guarded := deception.GuardTerminalOutput(output, session)
+			if guarded.Blocked {
+				recordLLMFallbackEvent(session, "complex_terminal_guard:"+guarded.Reason, cmd)
+				return
+			}
+			factGuarded := deception.GuardResponseFacts(guarded.Output, session, e.Topology)
+			if factGuarded.Blocked {
+				recordLLMFallbackEvent(session, "complex_fact_guard:"+factGuarded.Reason, cmd)
+				return
+			}
+			// Cache the LLM-rendered output for consistency on repeat commands.
+			storeAndInject(cmd, factGuarded.Output, world, req.Terminal.CWD)
+			// Bump world version to invalidate Manager's planning response cache,
+			// so subsequent invocations reach HandleCommand → world cache → LLM output.
+			if session.Planning != nil {
+				session.Planning.BumpWorldVersion("llm_async_cached:" + cmdBase)
+			}
+			recordLLMFallbackEvent(session, "complex_llm_authored", cmd)
+		})
+	}()
 }
 
 // decisionClientNil reports whether no decision client is attached.
@@ -925,13 +939,16 @@ func (e *RuleEngine) llmFallback(cmd string, session *domain.SessionContext, wor
 	// Fire async LLM call — return empty immediately so the command falls
 	// through to shellLikeFallback/command-not-found without blocking.
 	// The LLM result is cached for subsequent invocations.
-	go e.llmFallbackAsync(cmd, session, world)
+	e.llmFallbackAsync(cmd, session, world)
 	return ""
 }
 
 func (e *RuleEngine) llmFallbackAsync(cmd string, session *domain.SessionContext, world *domain.WorldState) {
+	key := session.SessionID + "|" + session.CWD + "|fallback|" + cmd
+	if !e.beginDecision(key) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
 
 	profile := deception.ProfileFromSession(session)
 	decision := deception.SelectStrategy(profile, session)
@@ -943,9 +960,9 @@ func (e *RuleEngine) llmFallbackAsync(cmd string, session *domain.SessionContext
 	}
 
 	req := deception.DecisionRequest{
-		SessionID: session.SessionID,
-		CallSite:  deception.SiteLLMFallback,
-		Command:   cmd,
+		SessionID:   session.SessionID,
+		CallSite:    deception.SiteLLMFallback,
+		Command:     cmd,
 		UserContent: fmt.Sprintf("Recent commands: %s\nFiles in cwd: %s\n%sRun this command and return only its output:\n%s", commandHistoryTail(session, 5), strings.Join(world.ListFiles(session.CWD), ", "), contextAwareSlice(cmd, session), cmd),
 		Terminal: &deception.TerminalRenderInput{
 			Hostname:         session.Hostname,
@@ -958,28 +975,34 @@ func (e *RuleEngine) llmFallbackAsync(cmd string, session *domain.SessionContext
 		},
 	}
 
-	resp, err := e.Decider.Decide(ctx, req)
-	if err != nil {
-		recordLLMFallbackEvent(session, "complete_error:"+err.Error(), cmd)
-		return
-	}
-	output := resp.Content
-	if output == "" {
-		recordLLMFallbackEvent(session, "empty_after_sanitize", cmd)
-		return
-	}
-	guarded := deception.GuardTerminalOutput(output, session)
-	if guarded.Blocked {
-		recordLLMFallbackEvent(session, "terminal_guard:"+guarded.Reason, cmd)
-		return
-	}
-	factGuarded := deception.GuardResponseFacts(guarded.Output, session, e.Topology)
-	if factGuarded.Blocked {
-		recordLLMFallbackEvent(session, "fact_guard:"+factGuarded.Reason, cmd)
-		return
-	}
-	storeAndInject(cmd, factGuarded.Output, world, session.CWD)
-	recordLLMFallbackEvent(session, "llm_fallback_async_cached", cmd)
+	go func() {
+		defer e.endDecision(key)
+		defer cancel()
+		resp, err := e.Decider.Decide(ctx, req)
+		if err != nil {
+			recordLLMFallbackEvent(session, "complete_error:"+err.Error(), cmd)
+			return
+		}
+		session.QueueMutation(func() {
+			output := resp.Content
+			if output == "" {
+				recordLLMFallbackEvent(session, "empty_after_sanitize", cmd)
+				return
+			}
+			guarded := deception.GuardTerminalOutput(output, session)
+			if guarded.Blocked {
+				recordLLMFallbackEvent(session, "terminal_guard:"+guarded.Reason, cmd)
+				return
+			}
+			factGuarded := deception.GuardResponseFacts(guarded.Output, session, e.Topology)
+			if factGuarded.Blocked {
+				recordLLMFallbackEvent(session, "fact_guard:"+factGuarded.Reason, cmd)
+				return
+			}
+			storeAndInject(cmd, factGuarded.Output, world, req.Terminal.CWD)
+			recordLLMFallbackEvent(session, "llm_fallback_async_cached", cmd)
+		})
+	}()
 }
 
 func recordLLMFallbackEvent(session *domain.SessionContext, reason, command string) {
@@ -1238,4 +1261,23 @@ func extractFlags(args []string) string {
 		}
 	}
 	return strings.Join(flags, " ")
+}
+
+// Coalesce repeated terminal commands while a cold-path request is outstanding.
+func (e *RuleEngine) beginDecision(key string) bool {
+	e.decisionMu.Lock()
+	defer e.decisionMu.Unlock()
+	if e.inflight == nil {
+		e.inflight = make(map[string]bool)
+	}
+	if e.inflight[key] {
+		return false
+	}
+	e.inflight[key] = true
+	return true
+}
+func (e *RuleEngine) endDecision(key string) {
+	e.decisionMu.Lock()
+	delete(e.inflight, key)
+	e.decisionMu.Unlock()
 }

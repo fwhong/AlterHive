@@ -1,0 +1,14 @@
+# Real keys belong only in manager.env (ALTERHIVE_OPENAI_API_KEY), not this file.
+enabled: false
+active_provider: openai
+providers:
+  - id: openai
+    name: OpenAI compatible
+    type: openai
+    base_url: https://api.openai.com/v1
+    key_env: ALTERHIVE_OPENAI_API_KEY
+    api_key: ""
+    model: replace-with-your-approved-model
+    max_tokens: 1600
+    temperature: 0.2
+    enabled: false

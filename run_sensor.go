@@ -1,48 +1,55 @@
 package main
 
 import (
-	"os"
-
+	"github.com/alterhive/alterhive/api"
 	"github.com/alterhive/alterhive/internal/deception"
-	"github.com/alterhive/alterhive/internal/llm"
+	"github.com/alterhive/alterhive/internal/ipc"
+	"github.com/alterhive/alterhive/internal/protocols/strategies/SSH"
+	"github.com/alterhive/alterhive/internal/sandbox"
 	"github.com/alterhive/alterhive/internal/session"
-
+	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 )
 
-// runSensor is the honeypot-only role. The process never reads llm.yaml and
-// holds no provider credentials; cold-path decisions are forwarded to the
-// central manager over ALTERHIVE_MANAGER_URL. When the manager is
-// unreachable, the hot path keeps serving deterministic responses exactly
-// like an LLM-disabled standalone deployment.
+// sensor is Unix-only: no provider config, no bearer token, no Internet sockets.
 func runSensor() {
-	managerURL := getEnv("ALTERHIVE_MANAGER_URL", "")
-	managerToken := os.Getenv("ALTERHIVE_MANAGER_TOKEN")
-	if managerURL == "" {
-		log.Fatal("ALTERHIVE_MANAGER_URL is required in sensor role")
-	}
-
 	configDir := resolveConfigDir()
+	if err := sandbox.CheckSensorEnvironment(configDir); err != nil {
+		log.Fatal(err)
+	}
+	if err := sandbox.LockNetwork(); err != nil {
+		log.Fatalf("cannot enforce sensor network isolation: %v", err)
+	}
 	topology, safety := loadTopology(configDir)
 	tr := newTracer()
-
-	// No llm.yaml is loaded here by design: the sensor's API server gets an
-	// empty (inactive, credential-free) LLM manager so the LLM admin routes
-	// report "not configured" instead of leaking manager-side state.
-	emptyLLM := llm.NewManager(&llm.LLMConfig{Providers: []llm.ProviderConfig{}}, "")
-
-	decider := deception.NewRemoteDecisionClient(managerURL, managerToken)
+	decider, err := deception.NewRemoteDecisionClient(getEnv("ALTERHIVE_DECISION_SOCKET", "/run/alterhive/decisions/decision.sock"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer decider.Close()
 	mgr := session.NewManager(topology, safety, tr, "staging-web-01", decider)
-
-	sshConf := loadSSHConfig(configDir)
-	startSSH(mgr, sshConf, tr)
-
-	startHoneypotAPI(mgr, emptyLLM, getEnv("API_ADDR", ":8000"))
-
-	log.WithFields(log.Fields{
-		"role":    RoleSensor,
-		"manager": managerURL,
-	}).Info("sensor started: cold path forwarded to manager")
-
+	uid := envUID("ALTERHIVE_INGRESS_UID", 10003)
+	sshListener, err := ipc.Listen(getEnv("ALTERHIVE_SSH_SOCKET", "/run/alterhive/ingress/ssh.sock"), uid)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer sshListener.Close()
+	// PROXY header is accepted ONLY after authenticating the Unix peer UID.
+	sshListener = ipc.ProxyListener(sshListener)
+	strategy := &SSH.SSHStrategy{Manager: mgr}
+	if err := strategy.Serve(loadSSHConfig(configDir), tr, sshListener); err != nil {
+		log.Fatal(err)
+	}
+	apiListener, err := ipc.Listen(getEnv("ALTERHIVE_API_SOCKET", "/run/alterhive/ingress/api.sock"), uid)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer apiListener.Close()
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
+	router.Use(gin.Recovery())
+	api.NewLocalServer(mgr).RegisterRoutes(router)
+	serveHTTP(apiListener, router)
+	log.Info("sensor started: AF_UNIX only, no credentials, no TCP/UDP sockets")
 	waitForShutdown()
 }

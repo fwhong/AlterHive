@@ -1,16 +1,15 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/alterhive/alterhive/internal/domain"
@@ -22,22 +21,15 @@ import (
 
 // Server is the REST API server.
 type Server struct {
-	manager *session.Manager
-	llm     *llm.Manager
-	token   string // Bearer token for auth
+	manager      *session.Manager
+	llm          *llm.Manager
+	token        string // Empty means disabled, never a public default.
+	trustedLocal bool   // Only used behind the UID-authenticated sensor Unix listener.
 }
-
-var (
-	runtimeRestartMu     sync.Mutex
-	runtimeRestartQueued bool
-)
 
 // NewServer creates a new API server.
 func NewServer(manager *session.Manager, llmMgr *llm.Manager) *Server {
 	token := os.Getenv("ALTERHIVE_ADMIN_TOKEN")
-	if token == "" {
-		token = "alterhive-admin-token"
-	}
 	return &Server{
 		manager: manager,
 		llm:     llmMgr,
@@ -51,8 +43,7 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 
 	v1 := r.Group("/api/v1")
 	{
-		v1.POST("/auth/login", s.login)
-		v1.GET("/auth/me", s.authMiddleware(), s.me)
+		s.RegisterAuthRoutes(v1)
 
 		v1.GET("/dashboard/summary", s.authMiddleware(), s.dashboardSummary)
 		v1.GET("/nodes", s.authMiddleware(), s.nodes)
@@ -63,23 +54,27 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		v1.DELETE("/sessions/:id", s.authMiddleware(), s.deleteSession)
 		v1.GET("/commands", s.authMiddleware(), s.commands)
 		v1.GET("/config/runtime", s.authMiddleware(), s.getRuntimeConfig)
-		v1.PATCH("/config/runtime", s.authMiddleware(), s.updateRuntimeConfig)
+		if s.llm != nil {
+			v1.PATCH("/config/runtime", s.authMiddleware(), s.updateRuntimeConfig)
+		}
 		v1.GET("/config/runtime/update-status", s.authMiddleware(), s.getRuntimeUpdateStatus)
 
 		// LLM management
-		s.RegisterLLMRoutes(v1)
+		if s.llm != nil {
+			s.RegisterLLMRoutes(v1)
+		}
 
 		v1.GET("/system/info", s.authMiddleware(), s.systemInfo)
 
 		// Network simulation API (for AI agents)
-		v1.POST("/simulate/nmap", s.simNmap)
-		v1.POST("/simulate/fscan", s.simFscan)
-		v1.POST("/simulate/curl", s.simCurl)
-		v1.POST("/simulate/ssh", s.simSSH)
-		v1.POST("/simulate/nc", s.simNC)
-		v1.POST("/simulate/ping", s.simPing)
-		v1.POST("/simulate/goal", s.simGoal)
-		v1.GET("/simulate/session/:id", s.simSessionStatus)
+		v1.POST("/simulate/nmap", s.authMiddleware(), s.simNmap)
+		v1.POST("/simulate/fscan", s.authMiddleware(), s.simFscan)
+		v1.POST("/simulate/curl", s.authMiddleware(), s.simCurl)
+		v1.POST("/simulate/ssh", s.authMiddleware(), s.simSSH)
+		v1.POST("/simulate/nc", s.authMiddleware(), s.simNC)
+		v1.POST("/simulate/ping", s.authMiddleware(), s.simPing)
+		v1.POST("/simulate/goal", s.authMiddleware(), s.simGoal)
+		v1.GET("/simulate/session/:id", s.authMiddleware(), s.simSessionStatus)
 	}
 }
 
@@ -98,8 +93,12 @@ func (s *Server) RegisterLLMRoutes(v1 *gin.RouterGroup) {
 
 func (s *Server) authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if s.trustedLocal {
+			c.Next()
+			return
+		}
 		auth := c.GetHeader("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != s.token {
+		if s.token == "" || !strings.HasPrefix(auth, "Bearer ") || subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(s.token)) != 1 {
 			c.JSON(http.StatusUnauthorized, gin.H{"ok": false, "message": "Unauthorized"})
 			c.Abort()
 			return
@@ -121,7 +120,7 @@ func (s *Server) login(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "message": "Invalid request"})
 		return
 	}
-	if req.Username == "admin" && req.Password == "admin" {
+	if s.token != "" && req.Username == "admin" && subtle.ConstantTimeCompare([]byte(req.Password), []byte(s.token)) == 1 {
 		c.JSON(http.StatusOK, gin.H{
 			"ok": true,
 			"data": gin.H{
@@ -159,7 +158,7 @@ func (s *Server) me(c *gin.Context) {
 }
 
 func (s *Server) dashboardSummary(c *gin.Context) {
-	sessions := s.manager.AllSessions()
+	sessions := s.manager.SessionViews()
 	commands := s.manager.AllCommands()
 
 	activeSessions := 0
@@ -256,7 +255,7 @@ func (s *Server) nodes(c *gin.Context) {
 func (s *Server) sessions(c *gin.Context) {
 	page, pageSize := paginationParams(c, 20)
 
-	allSessions := s.manager.AllSessions()
+	allSessions := s.manager.SessionViews()
 	if query := strings.ToLower(strings.TrimSpace(c.Query("query"))); query != "" {
 		filtered := allSessions[:0]
 		for _, sess := range allSessions {
@@ -300,7 +299,7 @@ func (s *Server) sessions(c *gin.Context) {
 
 func (s *Server) sessionDetail(c *gin.Context) {
 	id := c.Param("id")
-	sess := s.manager.GetSession(id)
+	sess := s.manager.SessionView(id)
 	if sess == nil {
 		c.JSON(http.StatusNotFound, gin.H{"ok": false, "message": "Session not found"})
 		return
@@ -317,7 +316,7 @@ func (s *Server) sessionDetail(c *gin.Context) {
 // one session. Dynamic nodes from other attacker sessions are never included.
 func (s *Server) sessionTopology(c *gin.Context) {
 	id := c.Param("id")
-	sess := s.manager.GetSession(id)
+	sess := s.manager.SessionView(id)
 	if sess == nil {
 		c.JSON(http.StatusNotFound, gin.H{"ok": false, "message": "Session not found"})
 		return
@@ -409,7 +408,7 @@ func (s *Server) sessionTopology(c *gin.Context) {
 
 func (s *Server) sessionCommands(c *gin.Context) {
 	id := c.Param("id")
-	sess := s.manager.GetSession(id)
+	sess := s.manager.SessionView(id)
 	if sess == nil {
 		c.JSON(http.StatusNotFound, gin.H{"ok": false, "message": "Session not found"})
 		return
@@ -524,6 +523,7 @@ func (s *Server) getRuntimeConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ok": true,
 		"data": gin.H{
+			"read_only": s.trustedLocal,
 			"honeypot": gin.H{
 				"ssh_port":        cfg.SSHPort,
 				"api_port":        cfg.APIPort,
@@ -560,12 +560,11 @@ func (s *Server) updateRuntimeConfig(c *gin.Context) {
 		return
 	}
 	writeRuntimeUpdateStatus(runtimeUpdateStatus{
-		Phase:     "queued",
-		Message:   "配置已写入，等待 Docker 更新任务启动",
+		Phase:     "complete",
+		Message:   "配置已保存；请由运维在容器外重启服务",
 		Config:    cfg,
 		UpdatedAt: time.Now().Format(time.RFC3339),
 	})
-	scheduleRuntimeRestart()
 	c.JSON(http.StatusOK, gin.H{
 		"ok": true,
 		"data": gin.H{
@@ -575,9 +574,10 @@ func (s *Server) updateRuntimeConfig(c *gin.Context) {
 				"topology_cidr":   cfg.TopologyCIDR,
 				"session_timeout": cfg.SessionTimeout,
 			},
-			"restart_queued": true,
+			"restart_queued":   false,
+			"restart_required": true,
 		},
-		"message": "Config saved. Restart queued.",
+		"message": "Config saved. Operator restart required.",
 	})
 }
 
@@ -680,74 +680,6 @@ func saveRuntimeConfig(cfg runtimeConfig) error {
 	return writeDotEnv("configs/.env", env, []string{"SSH_PORT", "API_PORT", "TOPOLOGY_CIDR", "SESSION_TIMEOUT"})
 }
 
-func scheduleRuntimeRestart() {
-	runtimeRestartMu.Lock()
-	if runtimeRestartQueued {
-		writeRuntimeUpdateStatus(runtimeUpdateStatus{
-			Phase:     "queued",
-			Message:   "已有配置更新任务正在执行，当前请求已合并",
-			Config:    loadRuntimeConfig(),
-			UpdatedAt: time.Now().Format(time.RFC3339),
-		})
-		runtimeRestartMu.Unlock()
-		return
-	}
-	runtimeRestartQueued = true
-	runtimeRestartMu.Unlock()
-
-	go func() {
-		time.Sleep(1500 * time.Millisecond)
-		if err := restartRuntimeContainers(); err != nil {
-			runtimeRestartMu.Lock()
-			runtimeRestartQueued = false
-			runtimeRestartMu.Unlock()
-			writeRuntimeUpdateStatus(runtimeUpdateStatus{
-				Phase:     "failed",
-				Message:   "Docker 更新任务启动失败",
-				Config:    loadRuntimeConfig(),
-				UpdatedAt: time.Now().Format(time.RFC3339),
-				Error:     err.Error(),
-			})
-			fmt.Fprintf(os.Stderr, "failed to restart AlterHive containers: %v\n", err)
-		} else {
-			runtimeRestartMu.Lock()
-			runtimeRestartQueued = false
-			runtimeRestartMu.Unlock()
-		}
-	}()
-}
-
-func restartRuntimeContainers() error {
-	running, err := exec.Command("docker", "ps", "-q", "--filter", "label=alterhive.role=config-applier").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to inspect running config appliers: %w: %s", err, strings.TrimSpace(string(running)))
-	}
-	if strings.TrimSpace(string(running)) != "" {
-		return nil
-	}
-
-	projectDir := firstNonEmpty(os.Getenv("ALTERHIVE_PROJECT_DIR"), "/workspace/alterhive", ".")
-	helperImage := firstNonEmpty(os.Getenv("ALTERHIVE_HELPER_IMAGE"), "alterhive-v100-honeypot:latest")
-	helperName := fmt.Sprintf("alterhive-config-applier-%d", time.Now().UnixNano())
-	script := "status_file=configs/runtime-update-status.json; now() { date -u +%Y-%m-%dT%H:%M:%SZ; }; printf '{\"phase\":\"running\",\"message\":\"Docker 正在重建并重启 honeypot/frontend\",\"updated_at\":\"%s\"}\\n' \"$(now)\" > \"$status_file\"; sleep 2; if docker compose --env-file configs/.env up -d --build --remove-orphans --force-recreate honeypot frontend; then printf '{\"phase\":\"complete\",\"message\":\"蜜罐配置已应用，容器已重新运行\",\"updated_at\":\"%s\"}\\n' \"$(now)\" > \"$status_file\"; docker container prune -f --filter label=com.docker.compose.project=alterhive-v1 >/dev/null 2>&1 || true; else code=$?; printf '{\"phase\":\"failed\",\"message\":\"Docker Compose 更新失败\",\"error\":\"exit %s\",\"updated_at\":\"%s\"}\\n' \"$code\" \"$(now)\" > \"$status_file\"; exit $code; fi"
-	cmd := exec.Command(
-		"docker", "run", "--rm", "-d",
-		"--name", helperName,
-		"--label", "alterhive.role=config-applier",
-		"-v", "/var/run/docker.sock:/var/run/docker.sock",
-		"-v", fmt.Sprintf("%s:%s", projectDir, projectDir),
-		"-w", projectDir,
-		"--entrypoint", "sh",
-		helperImage,
-		"-c", script,
-	)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
-	}
-	return nil
-}
-
 func runtimeUpdateStatusPath() string {
 	return firstNonEmpty(os.Getenv("RUNTIME_UPDATE_STATUS_PATH"), "configs/runtime-update-status.json")
 }
@@ -793,7 +725,7 @@ func readDotEnv(path string) map[string]string {
 func writeDotEnv(path string, env map[string]string, orderedKeys []string) error {
 	var lines []string
 	lines = append(lines, "# AlterHive runtime configuration")
-	lines = append(lines, "# Changes are applied by the automatic Docker Compose restart.")
+	lines = append(lines, "# Operator restart required to apply changes.")
 	written := map[string]bool{}
 	for _, key := range orderedKeys {
 		lines = append(lines, fmt.Sprintf("%s=%s", key, env[key]))
@@ -1031,6 +963,7 @@ func (s *Server) llmActive(c *gin.Context) {
 			"active_provider": cfg.ActiveProvider,
 			"enabled":         cfg.Enabled,
 			"is_active":       s.llm.IsActive(),
+			"read_only":       s.llm.ReadOnly(),
 			"providers":       cfg.Providers,
 		},
 		"message": "ok",
@@ -1081,13 +1014,6 @@ func (s *Server) llmUpdateProvider(c *gin.Context) {
 		return
 	}
 	cfg.ID = id
-
-	// Preserve existing API key if the incoming value is empty or masked
-	if strings.Contains(cfg.APIKey, "****") || cfg.APIKey == "" {
-		if existing := s.llm.GetProviderReal(id); existing != nil && existing.APIKey != "" {
-			cfg.APIKey = existing.APIKey
-		}
-	}
 
 	if err := s.llm.UpdateProvider(cfg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"ok": false, "message": err.Error()})
@@ -1144,3 +1070,18 @@ func (s *Server) llmModels(c *gin.Context) {
 		"message": "ok",
 	})
 }
+
+// NewLocalServer has no secrets and MUST only be served by ipc.Listen with the
+// configured ingress UID. The ingress authenticates all ops requests first.
+func NewLocalServer(manager *session.Manager) *Server {
+	return &Server{manager: manager, trustedLocal: true}
+}
+func (s *Server) RegisterAuthRoutes(v1 *gin.RouterGroup) {
+	if !s.trustedLocal {
+		v1.POST("/auth/login", s.login)
+	}
+	v1.GET("/auth/me", s.authMiddleware(), s.me)
+}
+
+// Authenticate is shared with the credential-holding ingress, not the sensor.
+func (s *Server) Authenticate() gin.HandlerFunc { return s.authMiddleware() }

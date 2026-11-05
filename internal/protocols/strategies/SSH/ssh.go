@@ -24,6 +24,13 @@ type SSHStrategy struct {
 }
 
 func (s *SSHStrategy) Init(servConf parser.BeelzebubServiceConfiguration, tr tracer.Tracer) error {
+	listener, err := net.Listen("tcp", servConf.Address)
+	if err != nil {
+		return err
+	}
+	return s.Serve(servConf, tr, listener)
+}
+func (s *SSHStrategy) Serve(servConf parser.BeelzebubServiceConfiguration, tr tracer.Tracer, listener net.Listener) error {
 	go func() {
 		server := &ssh.Server{
 			Addr:        servConf.Address,
@@ -41,7 +48,6 @@ func (s *SSHStrategy) Init(servConf parser.BeelzebubServiceConfiguration, tr tra
 
 				// Always reset to entry host on new connection — the entry port
 				// is the front door; lateral movement happens in-band via SSH.
-				sessionCtx.ResetToEntryHost()
 
 				// Inline SSH command (non-interactive)
 				if sess.RawCommand() != "" {
@@ -53,13 +59,13 @@ func (s *SSHStrategy) Init(servConf parser.BeelzebubServiceConfiguration, tr tra
 				}
 
 				// Interactive terminal
-				terminal := term.NewTerminal(sess, shellPrompt(sessionCtx))
+				terminal := term.NewTerminal(sess, shellPrompt(sessionCtx.SnapshotForAPI()))
 
 				for {
 					// Use ReadPassword during SSH auth to suppress echo
 					var commandInput string
 					var err error
-					if sessionCtx.SuppressShellPrompt {
+					if sessionCtx.SnapshotForAPI().SuppressShellPrompt {
 						passwordBytes, pErr := terminal.ReadPassword("")
 						commandInput = string(passwordBytes)
 						err = pErr
@@ -69,16 +75,18 @@ func (s *SSHStrategy) Init(servConf parser.BeelzebubServiceConfiguration, tr tra
 					if err != nil {
 						break
 					}
-					if sessionCtx.ShellMode == "bash" && (commandInput == "exit" || commandInput == "quit") {
+					if sessionCtx.SnapshotForAPI().ShellMode == "bash" && (commandInput == "exit" || commandInput == "quit") {
 						// Check if we're in nested SSH
 						if sessionCtx.IsNestedSSH() {
+							sessionCtx.LockCommand()
 							restoredWorld, _ := sessionCtx.ExitRemoteHost()
 							if restoredWorld != nil {
 								sessionCtx.World = restoredWorld
 							}
+							sessionCtx.UnlockCommand()
 							terminal.Write([]byte("logout\n"))
 							terminal.Write([]byte(fmt.Sprintf("Connection to %s closed.\n", sessionCtx.GetCurrentTarget())))
-							terminal.SetPrompt(shellPrompt(sessionCtx))
+							terminal.SetPrompt(shellPrompt(sessionCtx.SnapshotForAPI()))
 							continue
 						}
 						terminal.Write([]byte("logout\n"))
@@ -91,10 +99,10 @@ func (s *SSHStrategy) Init(servConf parser.BeelzebubServiceConfiguration, tr tra
 					}
 
 					// Suppress prompt during SSH password auth flow
-					if sessionCtx.SuppressShellPrompt {
+					if sessionCtx.SnapshotForAPI().SuppressShellPrompt {
 						terminal.SetPrompt("")
 					} else {
-						terminal.SetPrompt(shellPrompt(sessionCtx))
+						terminal.SetPrompt(shellPrompt(sessionCtx.SnapshotForAPI()))
 					}
 				}
 
@@ -133,7 +141,7 @@ func (s *SSHStrategy) Init(servConf parser.BeelzebubServiceConfiguration, tr tra
 				return matched
 			},
 		}
-		if err := server.ListenAndServe(); err != nil {
+		if err := server.Serve(listener); err != nil {
 			log.Errorf("error during init SSH Protocol: %s", err.Error())
 		}
 	}()

@@ -1,7 +1,10 @@
 package llm
 
 import (
+	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"unicode"
 
@@ -16,16 +19,17 @@ type ModelInfo struct {
 
 // ProviderConfig represents a single LLM provider configuration.
 type ProviderConfig struct {
-	ID          string  `yaml:"id" json:"id"`
-	Name        string  `yaml:"name" json:"name"`
-	Type        string  `yaml:"type" json:"type"` // "openai", "anthropic", "ollama"
-	BaseURL     string  `yaml:"base_url" json:"base_url"`
-	APIKey      string  `yaml:"api_key" json:"api_key"`
-	KeyEnv      string  `yaml:"key_env,omitempty" json:"key_env,omitempty"`
-	Model       string  `yaml:"model" json:"model"`
-	MaxTokens   int     `yaml:"max_tokens" json:"max_tokens"`
-	Temperature float64 `yaml:"temperature" json:"temperature"`
-	Enabled     bool    `yaml:"enabled" json:"enabled"`
+	ID            string  `yaml:"id" json:"id"`
+	Name          string  `yaml:"name" json:"name"`
+	Type          string  `yaml:"type" json:"type"` // "openai", "anthropic", "ollama"
+	BaseURL       string  `yaml:"base_url" json:"base_url"`
+	KeyConfigured bool    `yaml:"-" json:"key_configured"`
+	APIKey        string  `yaml:"api_key" json:"api_key"`
+	KeyEnv        string  `yaml:"key_env,omitempty" json:"key_env,omitempty"`
+	Model         string  `yaml:"model" json:"model"`
+	MaxTokens     int     `yaml:"max_tokens" json:"max_tokens"`
+	Temperature   float64 `yaml:"temperature" json:"temperature"`
+	Enabled       bool    `yaml:"enabled" json:"enabled"`
 }
 
 // APIKeyEnv returns the environment variable used for this provider's secret.
@@ -78,14 +82,25 @@ func LoadLLMConfig(path string) (*LLMConfig, error) {
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return nil, err
 	}
-	// Set defaults
+	// Reject unsafe endpoint configuration before any provider is instantiated.
+	seen := make(map[string]bool)
 	for i := range config.Providers {
+		if err := validateProvider(config.Providers[i]); err != nil {
+			return nil, fmt.Errorf("provider %d: %w", i, err)
+		}
+		if seen[config.Providers[i].ID] {
+			return nil, fmt.Errorf("duplicate provider id")
+		}
+		seen[config.Providers[i].ID] = true
 		if config.Providers[i].MaxTokens == 0 {
 			config.Providers[i].MaxTokens = 2048
 		}
 		if config.Providers[i].Temperature == 0 {
 			config.Providers[i].Temperature = 0.7
 		}
+	}
+	if config.Enabled && config.GetActiveProvider() == nil {
+		return nil, fmt.Errorf("enabled configuration requires an existing active provider")
 	}
 	return &config, nil
 }
@@ -111,5 +126,38 @@ func (c *LLMConfig) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	f, err := os.CreateTemp(filepath.Dir(path), ".llm-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	defer os.Remove(name)
+	if err = f.Chmod(0600); err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(name, path)
+}
+
+func validateProvider(c ProviderConfig) error {
+	if c.ID == "" {
+		return fmt.Errorf("provider id required")
+	}
+	if c.Type != "openai" && c.Type != "anthropic" && c.Type != "ollama" {
+		return fmt.Errorf("unsupported provider type")
+	}
+	u, err := url.Parse(c.BaseURL)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("invalid provider base URL")
+	}
+	return nil
 }

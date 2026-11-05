@@ -133,7 +133,10 @@ func (m *Manager) SetEntryNetwork(sessionID, ip, cidr, gateway string) {
 	session := m.sessions[sessionID]
 	m.mu.RUnlock()
 	if session != nil {
+		session.LockCommand()
 		session.SetEntryNetwork(ip, cidr, gateway)
+		session.ResetToEntryHost()
+		session.UnlockCommand()
 	}
 }
 
@@ -161,9 +164,7 @@ func (m *Manager) idleSessionCleaner() {
 	for range ticker.C {
 		m.mu.Lock()
 		for _, sess := range m.sessions {
-			if sess.IsConnected() && time.Since(sess.LastActivity) > sessionReuseTimeout {
-				sess.MarkDisconnected()
-			}
+			sess.DisconnectIfIdle(sessionReuseTimeout)
 		}
 		// Clean up stale index entries
 		for key, sid := range m.sessionsByAddr {
@@ -185,6 +186,15 @@ func (m *Manager) ExecuteCommand(sessionID, command string) string {
 	if !ok {
 		return "bash: session expired\n"
 	}
+	session.LockCommand()
+	defer session.UnlockCommand()
+	return m.executeCommandLocked(session, command)
+}
+
+// Caller owns the session command lock across multi-step auth/command flows.
+func (m *Manager) executeCommandLocked(session *domain.SessionContext, command string) string {
+	sessionID := session.SessionID
+	session.ApplyPending()
 	session.Touch()
 	world := session.World
 	if world == nil {
@@ -256,6 +266,11 @@ func (m *Manager) ExecuteCommand(sessionID, command string) string {
 
 	// 7. Rule engine
 	cacheKey := responseCacheKey(command, session)
+	// The engine owns enriched-output caching. Caching a deterministic fallback
+	// here would permanently suppress retry after throttling/outage/re-enable.
+	if m.engine.Decider != nil {
+		cacheKey = ""
+	}
 	var output string
 	var engineEvidenceHits []string
 	var llmGenerated bool
@@ -268,7 +283,6 @@ func (m *Manager) ExecuteCommand(sessionID, command string) string {
 			session.Planning.StoreResponse(cacheKey, output)
 		}
 	}
-
 
 	// 7b. Invalidate dynamic rule cache on write operations
 	if dir := detectWriteTarget(command); dir != "" {
@@ -476,11 +490,16 @@ func (m *Manager) ExecuteNonInteractiveCommand(sessionID, command string) string
 	m.mu.RLock()
 	session := m.sessions[sessionID]
 	m.mu.RUnlock()
-	if session != nil && session.PendingSSHAuth != nil {
+	if session == nil {
+		return "bash: session expired\n"
+	}
+	session.LockCommand()
+	defer session.UnlockCommand()
+	if session.PendingSSHAuth != nil {
 		session.ClearPendingSSHAuth()
 	}
 
-	output := m.ExecuteCommand(sessionID, command)
+	output := m.executeCommandLocked(session, command)
 	if session != nil && session.PendingSSHAuth != nil {
 		pending := session.PendingSSHAuth
 		session.ClearPendingSSHAuth()
@@ -508,14 +527,19 @@ func (m *Manager) ResolveAutoSSH(sessionID string) string {
 	m.mu.RLock()
 	session := m.sessions[sessionID]
 	m.mu.RUnlock()
-	if session == nil || session.PendingSSHAuth == nil {
+	if session == nil {
+		return ""
+	}
+	session.LockCommand()
+	defer session.UnlockCommand()
+	if session.PendingSSHAuth == nil {
 		return ""
 	}
 	pending := session.PendingSSHAuth
 	if pending.ExpectedPassword == "" || pending.SelfSSH {
 		return ""
 	}
-	return m.ExecuteCommand(sessionID, pending.ExpectedPassword)
+	return m.executeCommandLocked(session, pending.ExpectedPassword)
 }
 
 // MarkDisconnected ends a session.
@@ -586,7 +610,7 @@ func (m *Manager) AllCommands() []domain.CommandEntry {
 	defer m.mu.RUnlock()
 	var commands []domain.CommandEntry
 	for _, s := range m.sessions {
-		commands = append(commands, s.CommandLog...)
+		commands = append(commands, s.Commands()...)
 	}
 	return commands
 }
@@ -608,6 +632,12 @@ func (m *Manager) SafetyRef() *domain.SafetyPolicy {
 
 // PlanTopology expands the graph for API/simulation paths using the same planner as SSH.
 func (m *Manager) PlanTopology(session *domain.SessionContext, command string) {
+	if session == nil {
+		return
+	}
+	session.LockCommand()
+	defer session.UnlockCommand()
+	session.ApplyPending()
 	if m.orchestrator == nil || session == nil {
 		return
 	}
@@ -686,7 +716,6 @@ func (m *Manager) injectPPFTopology(session *domain.SessionContext) {
 	}
 }
 
-
 // handlePendingSSHAuth processes a password attempt during a simulated SSH auth flow.
 // Password input is not echoed or logged. Denials are appended to the original ssh command's
 // output so the terminal replay shows the full auth flow as one block.
@@ -713,7 +742,6 @@ func (m *Manager) handlePendingSSHAuth(session *domain.SessionContext, sessionID
 		// Correct password — authenticate
 		session.PendingSSHAuth = nil
 		session.SuppressShellPrompt = false
-
 
 		host := m.topology.GetHostForSession(pending.TargetIP, session.SessionID)
 		hostname := pending.TargetIP
@@ -1021,4 +1049,16 @@ func injectContradictoryClue(world *domain.WorldState, session *domain.SessionCo
 	} else if !strings.Contains(entry.Content, "Accepted publickey for ansible") {
 		entry.Content = contradictory + entry.Content
 	}
+}
+
+// SessionViews are detached snapshots for concurrent management serialization.
+func (m *Manager) SessionViews() []*domain.SessionContext {
+	sessions := m.AllSessions()
+	for i, s := range sessions {
+		sessions[i] = s.SnapshotForAPI()
+	}
+	return sessions
+}
+func (m *Manager) SessionView(id string) *domain.SessionContext {
+	return m.GetSession(id).SnapshotForAPI()
 }

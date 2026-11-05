@@ -1,20 +1,21 @@
-# ── Builder stage ──────────────────────────────────────────────
+# Source build. Secrets are excluded from the build context AND explicit runtime COPYs.
 FROM golang:1.25-alpine AS builder
-WORKDIR /app
-
+WORKDIR /src
 COPY go.mod go.sum ./
-RUN GOPROXY=https://goproxy.cn,direct go mod download
-
+RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOPROXY=https://goproxy.cn,direct go build -ldflags="-s -w" -o alterhive .
+ARG TARGETOS=linux
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /alterhive . && \
+    mkdir -p /sockets && chmod 0750 /sockets && touch /sockets/.keep
 
-# ── Runtime stage ──────────────────────────────────────────────
-FROM alpine:3.20
-RUN apk --no-cache add ca-certificates tzdata curl docker-cli docker-cli-compose && \
-    addgroup -S app && adduser -S app -G app
+FROM scratch
 WORKDIR /app
-COPY --from=builder /app/alterhive .
-COPY --from=builder /app/configs ./configs
-RUN chown -R app:app /app
-EXPOSE 2222 8000
-CMD ["./alterhive"]
+COPY --from=builder /alterhive /app/alterhive
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /src/configs/topology.yaml /app/configs/topology.yaml
+COPY --from=builder /src/configs/services/ssh.yaml /app/configs/services/ssh.yaml
+COPY --from=builder --chown=10001:20000 /sockets/ /run/alterhive/decisions/
+COPY --from=builder --chown=10002:20000 /sockets/ /run/alterhive/ingress/
+USER 10002:20000
+ENTRYPOINT ["/app/alterhive"]

@@ -78,7 +78,7 @@ func TestLLMWorldPatchAgentAppliesStructuredPatch(t *testing.T) {
 	// LLM personas/exploits are now async — they land on the next cycle.
 	// Verify the async LLM event was stored.
 	foundAsync := false
-	for _, ev := range session.EventLog {
+	for _, ev := range session.Events() {
 		if ev.Type == "llm_world_patch_async" {
 			foundAsync = true
 			break
@@ -119,7 +119,7 @@ func TestLLMWorldPatchCandidatePromotesAfterGate(t *testing.T) {
 
 	// Async LLM should have been triggered.
 	foundAsync := false
-	for _, ev := range session.EventLog {
+	for _, ev := range session.Events() {
 		if ev.Type == "llm_world_patch_async" {
 			foundAsync = true
 			break
@@ -235,7 +235,7 @@ func TestGoalShiftInvalidatesResponseCache(t *testing.T) {
 		t.Fatalf("expected stale cached response to be invalidated, got ok=%t cached=%q", ok, cached)
 	}
 	found := false
-	for _, event := range session.EventLog {
+	for _, event := range session.Events() {
 		if event.Type == "plan_invalidated" {
 			found = true
 			break
@@ -309,7 +309,7 @@ func TestActivePlanInvalidatorTriggersFullReplan(t *testing.T) {
 		t.Fatal("expected stale response cache to be cleared")
 	}
 	found := false
-	for _, event := range session.EventLog {
+	for _, event := range session.Events() {
 		if event.Type == "plan_invalidated" && strings.Contains(event.Detail, "critical_evidence_read") {
 			found = true
 			break

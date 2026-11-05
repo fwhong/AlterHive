@@ -1,67 +1,80 @@
-# AlterHive manager/sensor split deployment (issue #3: edge-node sub-agent
-# callback architecture).
-#
-# The manager holds all LLM provider credentials (configs/llm.yaml +
-# ALTERHIVE_*_API_KEY) and is the only container allowed to reach an LLM
-# endpoint. Sensors run the honeypot only; their decision egress is the
-# manager on the private alterhive-internal network.
-#
-# Standalone (upstream) behavior remains available by running the image with
-# ALTERHIVE_ROLE unset.
+# Local sidecar deployment. Sensor has NO network interface other than loopback,
+# and its own irreversible seccomp filter also denies all non-Unix socket creation.
+x-hardening: &hardening
+  image: "${ALTERHIVE_IMAGE:-alterhive:split}"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 256
+  mem_limit: 512m
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
+  restart: unless-stopped
 services:
   manager:
-    image: "${ALTERHIVE_IMAGE:-alterhive-v100-honeypot:latest}"
-    container_name: alterhive-manager
-    command: ["./alterhive"]
+    <<: *hardening
+    user: "10001:20000"
     environment:
       ALTERHIVE_ROLE: manager
       CONFIG_DIR: /app/configs
-      # Required: refuse to start without auth (fail closed).
-      ALTERHIVE_MANAGER_TOKEN: ${ALTERHIVE_MANAGER_TOKEN:?set ALTERHIVE_MANAGER_TOKEN}
-      ALTERHIVE_MANAGER_ADDR: ":8100"
-      # Manager-side gate for provider egress (must be true for LLM use).
+      ALTERHIVE_DECISION_SOCKET: /run/alterhive/decisions/decision.sock
+      ALTERHIVE_SENSOR_UID: "10002"
       ALTERHIVE_ALLOW_LLM_NETWORK: "true"
+      ALTERHIVE_LLM_CONFIG_READ_ONLY: "true"
+      ALTERHIVE_ADMIN_ADDR: ":8110"
+      ALTERHIVE_ADMIN_TOKEN: ${ALTERHIVE_ADMIN_TOKEN:?generate an independent manager admin token}
+    env_file: [./manager.env]
     volumes:
-      # llm.yaml lives ONLY here: provider ids, base_url, api_key (or
-      # ALTERHIVE_<ID>_API_KEY env on this service).
       - ./manager-configs:/app/configs:ro
-    networks:
-      - alterhive-internal
-      - alterhive-ops
-    restart: unless-stopped
+      - decisions:/run/alterhive/decisions
+    ports: ["${MANAGER_API_PUBLISH:-127.0.0.1:8110}:8110"]
+    networks: [ops]
 
   sensor:
-    image: "${ALTERHIVE_IMAGE:-alterhive-v100-honeypot:latest}"
-    container_name: alterhive-sensor
-    command: ["./alterhive"]
+    <<: *hardening
+    user: "10002:20000"
+    network_mode: none
     environment:
       ALTERHIVE_ROLE: sensor
       CONFIG_DIR: /app/configs
-      ALTERHIVE_MANAGER_URL: http://alterhive-manager:8100
-      ALTERHIVE_MANAGER_TOKEN: ${ALTERHIVE_MANAGER_TOKEN:?set ALTERHIVE_MANAGER_TOKEN}
-      SSH_ADDR: "${SENSOR_SSH_ADDR:-0.0.0.0:2222}"
-      API_ADDR: ":8000"
-      # Sensor-side gate: allow sending session context to the manager.
+      ALTERHIVE_DECISION_SOCKET: /run/alterhive/decisions/decision.sock
+      ALTERHIVE_SSH_SOCKET: /run/alterhive/ingress/ssh.sock
+      ALTERHIVE_API_SOCKET: /run/alterhive/ingress/api.sock
+      ALTERHIVE_INGRESS_UID: "10003"
       ALTERHIVE_ALLOW_LLM_CONTEXT_EXPORT: "true"
-      # Optionally override the admin token of the sensor's own :8000 API.
-      # ALTERHIVE_ADMIN_TOKEN: sensor-admin-token
-    ports:
-      # Expose the honeypot SSH only where attackers should reach it.
-      - "${SENSOR_SSH_PUBLISH:-127.0.0.1:2222}:2222"
-      # Ops-facing session viewing (frontend talks to this).
-      - "${SENSOR_API_PUBLISH:-127.0.0.1:8000}:8000"
     volumes:
-      # topology.yaml + services/ssh.yaml only — NO llm.yaml here by design.
       - ./sensor-configs:/app/configs:ro
-    networks:
-      - alterhive-internal
-    depends_on:
-      - manager
-    restart: unless-stopped
+      - decisions:/run/alterhive/decisions:ro
+      - ingress:/run/alterhive/ingress
+    depends_on: [manager]
 
+  ingress:
+    <<: *hardening
+    user: "10003:20000"
+    environment:
+      ALTERHIVE_ROLE: ingress
+      SSH_ADDR: ":2222"
+      API_ADDR: ":8000"
+      ALTERHIVE_ADMIN_TOKEN: ${ALTERHIVE_SENSOR_ADMIN_TOKEN:?generate an independent ingress admin token}
+    volumes:
+      - ingress:/run/alterhive/ingress:ro
+    ports:
+      - "${SENSOR_SSH_PUBLISH:-127.0.0.1:2222}:2222"
+      - "${SENSOR_API_PUBLISH:-127.0.0.1:8000}:8000"
+    networks: [edge]
+    depends_on: [sensor]
+
+  frontend:
+    profiles: [ui]
+    build: ../../frontend
+    ports: ["${FRONTEND_PUBLISH:-127.0.0.1:3000}:80"]
+    networks: [edge, ops]
+    depends_on: [ingress, manager]
+
+volumes:
+  decisions:
+  ingress:
 networks:
-  # Decision traffic: sensors → manager. No external exposure.
-  alterhive-internal:
-    internal: true
-  # Ops access to the manager's LLM admin API (:8100) and healthz.
-  alterhive-ops:
+  # Published ports must work on Docker Desktop too. Only the LLM-credential-free
+  # TCP ingress attaches here; the sensor remains network_mode:none.
+  edge:
+  ops:

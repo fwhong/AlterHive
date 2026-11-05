@@ -1,51 +1,84 @@
 package main
 
 import (
-	"net/http"
-	"os"
-
 	"github.com/alterhive/alterhive/api"
 	"github.com/alterhive/alterhive/internal/decisionsvc"
-
+	"github.com/alterhive/alterhive/internal/ipc"
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
 )
 
-// runManager is the central decision role. It holds the LLM providers and
-// credentials (configs/llm.yaml + ALTERHIVE_*_API_KEY env), serves sensor
-// decisions on ALTERHIVE_MANAGER_ADDR and exposes the LLM admin API. It runs
-// no SSH listener and no session state.
+// Decision IPC and ops HTTP have disjoint routers, listeners and credentials.
 func runManager() {
-	token := os.Getenv("ALTERHIVE_MANAGER_TOKEN")
-	if token == "" {
-		log.Fatal("ALTERHIVE_MANAGER_TOKEN is required in manager role (refusing to start with no auth)")
+	if os.Getenv("ALTERHIVE_MANAGER_TOKEN") != "" || os.Getenv("ALTERHIVE_MANAGER_ADDR") != "" {
+		log.Fatal("legacy TCP decision configuration is not supported")
 	}
-
-	configDir := resolveConfigDir()
-	llmMgr := loadLocalLLM(configDir)
-
-	addr := getEnv("ALTERHIVE_MANAGER_ADDR", ":8100")
-
+	llmMgr := loadLocalLLM(resolveConfigDir())
+	readonly, err := strconv.ParseBool(getEnv("ALTERHIVE_LLM_CONFIG_READ_ONLY", "true"))
+	if err != nil {
+		log.Fatal("invalid ALTERHIVE_LLM_CONFIG_READ_ONLY")
+	}
+	llmMgr.SetReadOnly(readonly)
+	listener, err := ipc.Listen(getEnv("ALTERHIVE_DECISION_SOCKET", "/run/alterhive/decisions/decision.sock"), envUID("ALTERHIVE_SENSOR_UID", 10002))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer listener.Close()
 	gin.SetMode(gin.ReleaseMode)
-	router := gin.New()
-	router.Use(gin.Recovery())
-	router.Use(corsMiddleware())
-
-	// Decision service (sensor→manager cold path).
-	svc := decisionsvc.NewServer(llmMgr, token)
-	svc.RegisterRoutes(router)
-
-	// LLM administration (ops-facing) reusing the api package handlers.
-	admin := api.NewServer(nil, llmMgr)
-	admin.RegisterLLMRoutes(router.Group("/api/v1"))
-
-	log.WithFields(log.Fields{
-		"role":      RoleManager,
-		"addr":      addr,
-		"llm_active": llmMgr.IsActive(),
-	}).Info("manager started: holding LLM credentials, serving decisions")
-
-	if err := http.ListenAndServe(addr, router); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("manager server error: %v", err)
+	decisions := gin.New()
+	decisions.Use(gin.Recovery())
+	decisionsvc.NewServer(llmMgr).RegisterRoutes(decisions)
+	serveHTTP(listener, decisions)
+	// No admin listener at all unless explicitly configured with a strong token.
+	if addr := os.Getenv("ALTERHIVE_ADMIN_ADDR"); addr != "" {
+		requireAdminToken()
+		ops := gin.New()
+		ops.Use(gin.Recovery(), corsMiddleware())
+		admin := api.NewServer(nil, llmMgr)
+		v1 := ops.Group("/api/v1")
+		admin.RegisterAuthRoutes(v1)
+		admin.RegisterLLMRoutes(v1)
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer ln.Close()
+		serveHTTP(ln, ops)
 	}
+	log.Info("manager started: UID-authenticated Unix decisions; separate ops listener")
+	waitForShutdown()
+}
+func envUID(name string, fallback uint32) uint32 {
+	v := os.Getenv(name)
+	if v == "" {
+		return fallback
+	}
+	n, e := strconv.ParseUint(v, 10, 32)
+	if e != nil {
+		log.Fatalf("invalid %s", name)
+	}
+	return uint32(n)
+}
+func requireAdminToken() {
+	if len(os.Getenv("ALTERHIVE_ADMIN_TOKEN")) < 32 {
+		log.Fatal("ALTERHIVE_ADMIN_TOKEN must contain at least 32 characters")
+	}
+}
+func serveHTTP(ln net.Listener, handler http.Handler) *http.Server {
+	bounded := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 256<<10)
+		handler.ServeHTTP(w, r)
+	})
+	s := &http.Server{Handler: bounded, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 65 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
+	go func() {
+		if err := s.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.WithError(err).Fatal("HTTP server stopped")
+		}
+	}()
+	return s
 }
