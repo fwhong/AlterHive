@@ -27,9 +27,10 @@ type CompletionRequest struct {
 
 // CompletionResponse is the response from a completion.
 type CompletionResponse struct {
-	Content string `json:"content"`
-	Model   string `json:"model"`
-	Usage   struct {
+	Content      string `json:"content"`
+	Model        string `json:"model"`
+	FinishReason string `json:"finish_reason,omitempty"`
+	Usage        struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
 		TotalTokens      int `json:"total_tokens"`
@@ -89,6 +90,9 @@ func (p *openAIProvider) Complete(ctx context.Context, req CompletionRequest) (*
 	if body["temperature"] == 0 {
 		body["temperature"] = p.cfg.Temperature
 	}
+	if p.cfg.Thinking != "" {
+		body["thinking"] = map[string]string{"type": p.cfg.Thinking}
+	}
 	if req.ResponseFormat == "json_object" {
 		body["response_format"] = map[string]string{"type": "json_object"}
 	}
@@ -124,9 +128,9 @@ func (p *openAIProvider) Complete(ctx context.Context, req CompletionRequest) (*
 
 	var openAIResp struct {
 		Choices []struct {
-			Message struct {
-				Content          string `json:"content"`
-				ReasoningContent string `json:"reasoning_content"`
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
 		Model string `json:"model"`
@@ -144,13 +148,21 @@ func (p *openAIProvider) Complete(ctx context.Context, req CompletionRequest) (*
 		return nil, fmt.Errorf("no choices in response")
 	}
 
-	content := openAIResp.Choices[0].Message.Content
+	choice := openAIResp.Choices[0]
+	// Truncated/refused/tool-call responses are not final terminal text or JSON.
+	// Some compatible endpoints omit finish_reason; retain that legacy contract,
+	// but never substitute hidden reasoning for a missing final answer.
+	if choice.FinishReason != "" && choice.FinishReason != "stop" {
+		return nil, fmt.Errorf("incomplete provider response")
+	}
+	content := choice.Message.Content
 	if strings.TrimSpace(content) == "" {
-		content = openAIResp.Choices[0].Message.ReasoningContent
+		return nil, fmt.Errorf("provider returned no final content")
 	}
 	result := &CompletionResponse{
-		Content: content,
-		Model:   openAIResp.Model,
+		Content:      content,
+		Model:        openAIResp.Model,
+		FinishReason: choice.FinishReason,
 	}
 	result.Usage = openAIResp.Usage
 	return result, nil
@@ -279,7 +291,8 @@ func (p *anthropicProvider) Complete(ctx context.Context, req CompletionRequest)
 	}
 
 	var anthropicResp struct {
-		Content []struct {
+		StopReason string `json:"stop_reason"`
+		Content    []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
@@ -293,6 +306,9 @@ func (p *anthropicProvider) Complete(ctx context.Context, req CompletionRequest)
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
 
+	if anthropicResp.StopReason != "" && anthropicResp.StopReason != "end_turn" && anthropicResp.StopReason != "stop_sequence" {
+		return nil, fmt.Errorf("incomplete provider response")
+	}
 	if len(anthropicResp.Content) == 0 {
 		return nil, fmt.Errorf("no content in response")
 	}
@@ -304,9 +320,13 @@ func (p *anthropicProvider) Complete(ctx context.Context, req CompletionRequest)
 		}
 	}
 
+	if strings.TrimSpace(strings.Join(textParts, "")) == "" {
+		return nil, fmt.Errorf("provider returned no final content")
+	}
 	result := &CompletionResponse{
-		Content: strings.Join(textParts, ""),
-		Model:   anthropicResp.Model,
+		FinishReason: anthropicResp.StopReason,
+		Content:      strings.Join(textParts, ""),
+		Model:        anthropicResp.Model,
 	}
 	result.Usage.PromptTokens = anthropicResp.Usage.InputTokens
 	result.Usage.CompletionTokens = anthropicResp.Usage.OutputTokens
@@ -424,7 +444,9 @@ func (p *ollamaProvider) Complete(ctx context.Context, req CompletionRequest) (*
 	}
 
 	var ollamaResp struct {
-		Message struct {
+		Done       *bool  `json:"done"`
+		DoneReason string `json:"done_reason"`
+		Message    struct {
 			Content string `json:"content"`
 		} `json:"message"`
 		Model string `json:"model"`
@@ -433,9 +455,16 @@ func (p *ollamaProvider) Complete(ctx context.Context, req CompletionRequest) (*
 		return nil, fmt.Errorf("parse response: %w", err)
 	}
 
+	if (ollamaResp.Done != nil && !*ollamaResp.Done) || (ollamaResp.DoneReason != "" && ollamaResp.DoneReason != "stop") {
+		return nil, fmt.Errorf("incomplete provider response")
+	}
+	if strings.TrimSpace(ollamaResp.Message.Content) == "" {
+		return nil, fmt.Errorf("provider returned no final content")
+	}
 	return &CompletionResponse{
-		Content: ollamaResp.Message.Content,
-		Model:   ollamaResp.Model,
+		FinishReason: ollamaResp.DoneReason,
+		Content:      ollamaResp.Message.Content,
+		Model:        ollamaResp.Model,
 	}, nil
 }
 

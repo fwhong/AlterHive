@@ -173,6 +173,7 @@ export interface RuntimeUpdateStatus {
 }
 
 export interface LLMProvider {
+  thinking?: "enabled" | "disabled";
   key_configured?: boolean;
   id: string;
   name: string;

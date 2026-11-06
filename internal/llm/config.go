@@ -19,17 +19,19 @@ type ModelInfo struct {
 
 // ProviderConfig represents a single LLM provider configuration.
 type ProviderConfig struct {
-	ID            string  `yaml:"id" json:"id"`
-	Name          string  `yaml:"name" json:"name"`
-	Type          string  `yaml:"type" json:"type"` // "openai", "anthropic", "ollama"
-	BaseURL       string  `yaml:"base_url" json:"base_url"`
-	KeyConfigured bool    `yaml:"-" json:"key_configured"`
-	APIKey        string  `yaml:"api_key" json:"api_key"`
-	KeyEnv        string  `yaml:"key_env,omitempty" json:"key_env,omitempty"`
-	Model         string  `yaml:"model" json:"model"`
-	MaxTokens     int     `yaml:"max_tokens" json:"max_tokens"`
-	Temperature   float64 `yaml:"temperature" json:"temperature"`
-	Enabled       bool    `yaml:"enabled" json:"enabled"`
+	ID            string `yaml:"id" json:"id"`
+	Name          string `yaml:"name" json:"name"`
+	Type          string `yaml:"type" json:"type"` // "openai", "anthropic", "ollama"
+	BaseURL       string `yaml:"base_url" json:"base_url"`
+	KeyConfigured bool   `yaml:"-" json:"key_configured"`
+	APIKey        string `yaml:"api_key" json:"api_key"`
+	KeyEnv        string `yaml:"key_env,omitempty" json:"key_env,omitempty"`
+	Model         string `yaml:"model" json:"model"`
+	// Explicit opt-in for compatible providers; never infer vendor options from a model name.
+	Thinking    string  `yaml:"thinking,omitempty" json:"thinking,omitempty"`
+	MaxTokens   int     `yaml:"max_tokens" json:"max_tokens"`
+	Temperature float64 `yaml:"temperature" json:"temperature"`
+	Enabled     bool    `yaml:"enabled" json:"enabled"`
 }
 
 // APIKeyEnv returns the environment variable used for this provider's secret.
@@ -154,6 +156,11 @@ func validateProvider(c ProviderConfig) error {
 	}
 	if c.Type != "openai" && c.Type != "anthropic" && c.Type != "ollama" {
 		return fmt.Errorf("unsupported provider type")
+	}
+	if c.Thinking != "" {
+		if c.Type != "openai" || (c.Thinking != "enabled" && c.Thinking != "disabled") {
+			return fmt.Errorf("thinking must be enabled or disabled for an openai-compatible provider")
+		}
 	}
 	u, err := url.Parse(c.BaseURL)
 	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {

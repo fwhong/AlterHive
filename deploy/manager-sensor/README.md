@@ -129,6 +129,34 @@ docker compose --env-file deploy/manager-sensor/.env up -d --force-recreate mana
 
 `restart` 不会重新读取 Compose env_file。连接测试和模型列表使用**已保存的配置**，不允许覆盖 endpoint 携带现有 key，也不跟随 HTTP redirect 转发凭据。管理响应只提供 `key_configured` 和脱敏配置；不能从 API 回读 key。绑定已有 key 的 endpoint 不能通过管理 API 静默变更，迁移 provider 应由运维同步审核 endpoint 和凭据。
 
+### 非流式调用与推理模型
+
+AH 使用非流式 Chat Completions；`base_url` 应为 API 基础地址（例如 `https://your-provider.example/v1`），**不要包含 `/chat/completions`**。不要把流式 curl 示例中的 `stream: true` 写进 YAML。
+
+对于支持 DeepSeek `thinking` 参数的 OpenAI-compatible 服务，可在所选 provider 下显式设置：
+
+```yaml
+    thinking: disabled
+```
+
+程序将其映射为请求体 `"thinking": {"type": "disabled"}`；不设置则不发送这个厂商参数，不根据模型名称猜测。只接受 `enabled` / `disabled`，且限 `type: openai`。参考 [DeepSeek 官方说明](https://api-docs.deepseek.com/guides/thinking_mode/)，第三方兼容服务仍需实际验证。
+
+推理内容会占用生成预算，`max_tokens` 小时可能仅得到半截答案。各决策调用点有自己的 token/temperature 参数（终端渲染为 800 tokens）；YAML 中的值是 provider 后备值，**不是覆盖所有调用点的统一预算**。优先选择能在终端 8 秒预算内完成的非推理模式，而不是盲目增加 tokens 或关闭安全校验。
+
+程序拒绝明确截断、过滤或工具调用等非最终 completion；`reasoning_content` 不再冒充最终输出。sensor 也检查 Nmap 增强结果是否保留规则基线的目标 IP 和开放端口，缺失时保留规则响应且不写入缓存。连接测试成功或 `llm_generated: true` 单独都不足以证明输出完整，应同时核查命令输出和规划事件。
+
+### 配置路径和本机代理排障
+
+- 实际生效文件是 **`deploy/manager-sensor/manager-configs/llm.yaml`**。不要将 `llm.yaml.example` 重命名为上一层的 `deploy/manager-sensor/llm.yaml`；该位置不会被 manager 挂载。
+- 若宿主能访问 provider、manager 容器却报 TLS `EOF`，先比较容器直连和受控代理的结果，不要关闭证书验证。
+- 在本次 Docker Desktop 环境中，既有宿主 HTTP 代理监听 `127.0.0.1:7890`，仅在 `manager.env` 添加下列配置后连接恢复：
+
+```dotenv
+HTTPS_PROXY=http://host.docker.internal:7890
+```
+
+这是**本机环境条件**，不是所有部署都需要的配置。其他机器应使用自己经过确认的代理/路由；Linux 上也不能假设 `host.docker.internal` 自动可用。不要把 proxy 或 key 变量复制到 sensor。修改后仍需重新创建 manager。
+
 ## 配置变更与日常运维
 
 ### 默认只读
@@ -261,6 +289,8 @@ ALTERHIVE_IMAGE=alterhive:split scripts/verify-split.sh
 | 构建/静态检查 | `go vet`、本机 build、Linux amd64 cross-build、镜像文件内容核查通过 |
 
 上述是该次实现验证记录，不代表每次文档编辑都重新跑过所有测试；请以重跑结果为准。Linux amd64 仅编译未实机运行；没有使用付费模型/真实 provider key，也未做浏览器逐页视觉回归。实测镜像采用本机 Go + `Dockerfile.runtime` 路径；另一条依赖 Docker Hub builder 的源码构建和完整前端 Nginx 镜像构建链不计入已通过项。前端构建有非阻断的主 chunk 体积提示。
+
+2026-11-06 的补充回归：增加截断/非最终响应、reasoning-only、显式 thinking 配置及 Nmap 缓存恢复测试后，Go race 为 194 个测试/子测试 × 3 轮，共 582 次通过；容器端到端仍为 39/39。真实兼容 provider 在显式关闭 thinking 后，已观察到完整 Nmap 增强输出、欺骗计划生成及拓扑扩展应用；这不是对所有模型/服务商的兼容性保证。原先仅验证 `llm_generated` 标记不足以发现半截输出，新回归同时核查必需事实。
 
 ## 安全保证的边界
 

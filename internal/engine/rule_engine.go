@@ -317,6 +317,10 @@ func (e *RuleEngine) handleComplexAsync(cmd, cmdBase string, session *domain.Ses
 				recordLLMFallbackEvent(session, "complex_fact_guard:"+factGuarded.Reason, cmd)
 				return
 			}
+			if !preservesScanFacts(cmdBase, ruleOutput, factGuarded.Output) {
+				recordLLMFallbackEvent(session, "complex_missing_scan_facts", cmd)
+				return
+			}
 			// Cache the LLM-rendered output for consistency on repeat commands.
 			storeAndInject(cmd, factGuarded.Output, world, req.Terminal.CWD)
 			// Bump world version to invalidate Manager's planning response cache,

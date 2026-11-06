@@ -9,6 +9,8 @@ providers:
     key_env: ALTERHIVE_OPENAI_API_KEY
     api_key: ""
     model: replace-with-your-approved-model
+    # For compatible DeepSeek reasoning models, explicitly opt out of thinking:
+    # thinking: disabled
     max_tokens: 1600
     temperature: 0.2
     enabled: false

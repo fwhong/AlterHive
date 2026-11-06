@@ -182,6 +182,8 @@ Web 用户名为 `admin`，密码为生成的 `.env` 中的 **`ALTERHIVE_SENSOR_
 docker compose --env-file deploy/manager-sensor/.env up -d --force-recreate manager
 ```
 
+推理模型可能把生成预算花在思考过程上。对已验证支持该选项的 DeepSeek-compatible 服务，可在 provider 下设置 `thinking: disabled`；详见 [非流式调用与推理模型](deploy/manager-sensor/README.md#非流式调用与推理模型)。
+
 `restart` 不会重新读取 Compose 的 `env_file`。更多操作见 [部署指南](deploy/manager-sensor/README.md)，包括配置样例、端口调整、关闭上下文导出、密钥轮换和旧版本迁移。
 
 ### 检查运行状态
